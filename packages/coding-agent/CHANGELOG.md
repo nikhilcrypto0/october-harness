@@ -22,6 +22,7 @@
 ### Fixed
 
 - Prevented managed git packages from automatically installing Pi peer dependencies and added warnings for extension packages that list host-provided modules in `dependencies` ([#9863](https://github.com/earendil-works/pi/issues/9863)).
+- Fixed the Fireworks default model pointing at the removed Kimi K2.6 model; it now defaults to Kimi K3.
 
 ## [0.87.1] - 2026-09-22
 
