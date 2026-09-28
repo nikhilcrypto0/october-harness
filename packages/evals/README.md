@@ -28,7 +28,26 @@ Scenario evals check harness behavior without credentials or network. Each run r
 npm run eval:scenarios -w packages/evals
 ```
 
-The command prints a Markdown summary and writes `scenarios.json` and `summary.md` under `.eval/`. It exits nonzero if any scenario fails. Pass `--scenarios <dir>` to run another pack, `--filter <text>` to select by path, and `--out <dir>` to choose the report directory.
+The command prints a Markdown summary and writes `scenarios.json` and `summary.md` under `.eval/`. It exits nonzero if any scenario fails. Pass `--scenarios <dir>` (repeatable) to run other packs instead of the bundled one, `--filter <text>` to select by path, and `--out <dir>` to choose the report directory.
+
+### Run against a real model
+
+The same scenarios run against any configured model. The `faux` script is ignored, the checks are unchanged, and cost is reported when the model is priced:
+
+```bash
+npm run eval:scenarios -w packages/evals -- --provider anthropic --model claude-sonnet-5
+```
+
+Credentials come from the host's stored login or environment, as for other evals. Add `--record <dir>` to save each run's assistant messages as a new scenario pack with the same prompt, fixture and checks. Compaction summaries are recorded in place, so a run that compacts still replays in order. A compaction that makes two summary requests (a split turn with earlier history) is recorded as one step and will not replay exactly. The recorded pack then replays with no credentials:
+
+```bash
+npm run eval:scenarios -w packages/evals -- --provider anthropic --model claude-sonnet-5 --record recorded/
+npm run eval:scenarios -w packages/evals -- --scenarios recorded/
+```
+
+### Scenario packs
+
+A pack is any directory tree of scenarios. Extensions and providers can keep a pack next to their code, for example `my-extension/scenarios/`, and run it with `--scenarios my-extension/scenarios`. Use a pack-specific prefix in scenario ids (`my-extension/...`) so reports from several packs don't collide.
 
 A scenario is a directory with `scenario.json` and an optional `workspace/` fixture:
 
@@ -50,8 +69,19 @@ A scenario is a directory with `scenario.json` and an optional `workspace/` fixt
 }
 ```
 
-- `faux` is the scripted model: each step is one assistant message, either `text` or a `toolCall`. A run that stops before using every step is reported as an error.
-- `expect` lists the checks. `file` checks `exists`, `contains`, `notContains`, or a `matches` regex; `command` runs in the final workspace and checks `exitCode` and `outputContains`; `toolCalls` checks counts and errors, optionally for one tool; `finalText` checks the last assistant text; `maxTurns` bounds the turns. Each check takes an optional `weight` (default 1).
+- `faux` is the scripted model: each step is one model response, either `text`, a `toolCall`, or `toolCalls` with optional `text`. A compaction summary is a model request too, so it takes the next step. A run that stops before using every step is reported as an error.
+- `expect` lists the checks. `file` checks `exists`, `contains`, `notContains`, or a `matches` regex; `command` runs in the final workspace and checks `exitCode` and `outputContains`; `toolCalls` checks counts and errors, optionally for one tool; `finalText` checks the last assistant text; `maxTurns` bounds the turns; `compactions` bounds completed compactions (a failed or aborted one always fails the check); `busCall` requires a call to a fake Bus tool whose listed `arguments` match, optionally an exact `count`. Each check takes an optional `weight` (default 1).
+
+Optional fields set up the run:
+
+| Field | Effect |
+| --- | --- |
+| `model` | `contextWindow` and `maxTokens` for the faux model, to create context pressure. Ignored for a real model. |
+| `compaction` | Enables threshold compaction with `reserveTokens` and `keepRecentTokens`. Compaction is off otherwise. |
+| `permissionMode` | Loads the October permission gate in `ask`, `accept-edits`, or `bypass`. A headless run blocks whatever the mode would prompt for, as a tool error. |
+| `bus` | Serves `tools` from an in-process fake October Bus through the real Bus tools, as `mcp__october-bus__<name>`. Each tool returns its `result` text; every call is recorded for `busCall` checks. |
+
+The bundled `core/` pack covers editing, command-failure recovery, context pressure, permission denial, and Bus response correlation.
 - The score is the weighted share of passing checks. A scenario passes when every check passes and the run had no errors.
 - Faux usage is estimated, so cost is reported as `n/a`.
 

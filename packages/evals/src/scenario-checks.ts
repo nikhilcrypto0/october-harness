@@ -8,12 +8,21 @@ const COMMAND_TIMEOUT_MS = 60_000;
 
 export type ToolExecution = { name: string; isError: boolean };
 
+export type Compaction = { reason: string; ok: boolean };
+export type BusCall = { name: string; arguments: Record<string, unknown> };
+
 export type RunObservation = {
 	workspace: string;
 	toolExecutions: ToolExecution[];
 	finalText: string;
 	turns: number;
+	compactions: Compaction[];
+	busCalls: BusCall[];
 };
+
+function isDeepEqual(left: unknown, right: unknown): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
 
 export type CheckResult = { check: string; passed: boolean; weight: number; detail?: string };
 
@@ -89,6 +98,33 @@ async function evaluate(check: ScenarioCheck, run: RunObservation): Promise<Omit
 			check: "final text",
 			passed,
 			detail: passed ? undefined : `missing ${JSON.stringify(check.finalText.contains)}`,
+		};
+	}
+	if ("compactions" in check) {
+		const { min, max } = check.compactions;
+		const completed = run.compactions.filter((compaction) => compaction.ok).length;
+		const failed = run.compactions.length - completed;
+		const failures: string[] = [];
+		if (min !== undefined && completed < min) failures.push(`${completed} compactions, expected at least ${min}`);
+		if (max !== undefined && completed > max) failures.push(`${completed} compactions, expected at most ${max}`);
+		if (failed > 0) failures.push(`${failed} compaction(s) failed or were aborted`);
+		return { check: "compactions", passed: failures.length === 0, detail: failures.join("; ") || undefined };
+	}
+	if ("busCall" in check) {
+		const { name, arguments: expected, count } = check.busCall;
+		const matching = run.busCalls.filter(
+			(call) =>
+				call.name === name &&
+				Object.entries(expected ?? {}).every(([key, value]) => isDeepEqual(call.arguments[key], value)),
+		);
+		const passed = count === undefined ? matching.length > 0 : matching.length === count;
+		return {
+			check: `Bus call ${name}`,
+			passed,
+			detail: passed
+				? undefined
+				: `${matching.length} matching of ${run.busCalls.filter((call) => call.name === name).length} ${name} call(s)` +
+					(count === undefined ? "" : `, expected ${count}`),
 		};
 	}
 	const passed = run.turns <= check.maxTurns;

@@ -173,6 +173,56 @@ describe("scenario evals", () => {
 		).rejects.toThrow("Scenario model not found: stand-in/missing");
 	});
 
+	const loadBundled = (id: string) => loadScenario(join(bundled, ...id.split("/")));
+
+	it("fails the permission scenario when the gate is bypassed", async () => {
+		const scenario = await loadBundled("core/permission-denial");
+
+		const result = await runScenario({ ...scenario, permissionMode: "bypass" });
+
+		expect(result.passed).toBe(false);
+		expect(result.checks.find((check) => check.check === "file marker.txt is absent")?.passed).toBe(false);
+		expect(process.env.OCTOBER_PERMISSION_MODE).toBeUndefined();
+	});
+
+	it("fails the Bus scenario when the reply is correlated to the wrong request", async () => {
+		const scenario = await loadBundled("core/bus-response-correlation");
+		const faux = scenario.faux.map((step) =>
+			"toolCall" in step && step.toolCall.name.endsWith("message_peer")
+				? { toolCall: { ...step.toolCall, args: { ...step.toolCall.args, responseTo: "msg-41" } } }
+				: step,
+		);
+
+		const result = await runScenario({ ...scenario, faux });
+
+		expect(result.passed).toBe(false);
+		expect(result.checks[0]).toMatchObject({
+			check: "Bus call message_peer",
+			passed: false,
+			detail: "0 matching of 1 message_peer call(s), expected 1",
+		});
+	});
+
+	it("fails the context-pressure scenario without compaction", async () => {
+		const { compaction: _compaction, ...scenario } = await loadBundled("core/context-pressure");
+
+		const result = await runScenario(scenario);
+
+		expect(result.passed).toBe(false);
+		expect(result.checks[0]).toMatchObject({ check: "compactions", passed: false });
+	});
+
+	it("records the compaction summary so a compacting run replays", async () => {
+		const scenario = await loadBundled("core/context-pressure");
+		const result = await runScenario(scenario);
+		expect(result.transcript).toHaveLength(3);
+
+		const recorded = await writeRecordedScenario(scenario, result.transcript, join(tempDir, "recorded"));
+		const replay = await runScenario(await loadScenario(recorded));
+
+		expect(replay).toMatchObject({ passed: true, errors: [] });
+	});
+
 	it("rejects an invalid scenario with every problem path", async () => {
 		write("s/scenario.json", { ...renameScenario, formatVersion: 2, sandbox: true, expect: [] });
 

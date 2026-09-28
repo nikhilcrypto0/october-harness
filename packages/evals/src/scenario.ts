@@ -72,6 +72,31 @@ const CheckSchema = Type.Union([
 		{ additionalProperties: false },
 	),
 	Type.Object({ maxTurns: Type.Integer({ minimum: 1 }), weight: Weight }, { additionalProperties: false }),
+	Type.Object(
+		{
+			compactions: Type.Object(
+				{ min: Type.Optional(Type.Integer({ minimum: 0 })), max: Type.Optional(Type.Integer({ minimum: 0 })) },
+				{ additionalProperties: false },
+			),
+			weight: Weight,
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			busCall: Type.Object(
+				{
+					name: Type.String({ minLength: 1 }),
+					/** Every listed argument must equal the call's value; other arguments are ignored. */
+					arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+					count: Type.Optional(Type.Integer({ minimum: 0 })),
+				},
+				{ additionalProperties: false },
+			),
+			weight: Weight,
+		},
+		{ additionalProperties: false },
+	),
 ]);
 
 const ScenarioSchema = Type.Object(
@@ -81,6 +106,44 @@ const ScenarioSchema = Type.Object(
 		description: Type.Optional(Type.String()),
 		prompt: Type.String({ minLength: 1 }),
 		tools: Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true }),
+		/** Faux model limits, for context-pressure scenarios. Ignored when a real model runs. */
+		model: Type.Optional(
+			Type.Object(
+				{
+					contextWindow: Type.Optional(Type.Integer({ minimum: 1000 })),
+					maxTokens: Type.Optional(Type.Integer({ minimum: 1 })),
+				},
+				{ additionalProperties: false },
+			),
+		),
+		/** Enables threshold compaction with these limits. Compaction is off otherwise. */
+		compaction: Type.Optional(
+			Type.Object(
+				{ reserveTokens: Type.Integer({ minimum: 0 }), keepRecentTokens: Type.Integer({ minimum: 0 }) },
+				{ additionalProperties: false },
+			),
+		),
+		/** Runs the October permission gate in this mode. A headless run blocks what the mode would prompt for. */
+		permissionMode: Type.Optional(Type.Enum(["ask", "accept-edits", "bypass"])),
+		/** Serves these tools from an in-process fake October Bus, exposed as `mcp__october-bus__<name>`. */
+		bus: Type.Optional(
+			Type.Object(
+				{
+					tools: Type.Array(
+						Type.Object(
+							{
+								name: Type.String({ minLength: 1 }),
+								description: Type.Optional(Type.String()),
+								result: Type.Optional(Type.String()),
+							},
+							{ additionalProperties: false },
+						),
+						{ minItems: 1 },
+					),
+				},
+				{ additionalProperties: false },
+			),
+		),
 		faux: Type.Array(FauxStepSchema, { minItems: 1 }),
 		expect: Type.Array(CheckSchema, { minItems: 1 }),
 	},

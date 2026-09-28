@@ -19,14 +19,27 @@ import {
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
+	type InlineExtension,
 	ModelRuntime,
 	readStoredCredential,
 	SessionManager,
 	SettingsManager,
 } from "@october-dev/october";
+// The October permission gate and Bus tools are not public exports; the runner loads them from source
+// exactly as the `october` extension registers them.
+import { parseOctoberBusEnv } from "../../coding-agent/src/extensions/october/bus/env.ts";
+import { registerOctoberBusTools } from "../../coding-agent/src/extensions/october/bus/tools.ts";
+import { registerOctoberPermissions } from "../../coding-agent/src/extensions/october/permissions.ts";
 import { applyIsolatedEnvironment } from "./harness.ts";
 import type { FauxStep, LoadedScenario } from "./scenario.ts";
-import { type CheckResult, evaluateChecks, scoreChecks, type ToolExecution } from "./scenario-checks.ts";
+import { type ScenarioBus, startScenarioBus } from "./scenario-bus.ts";
+import {
+	type CheckResult,
+	type Compaction,
+	evaluateChecks,
+	scoreChecks,
+	type ToolExecution,
+} from "./scenario-checks.ts";
 
 export type ScenarioModelSelection = { provider: string; id: string };
 
@@ -82,23 +95,19 @@ function toAssistantMessage(step: FauxStep): AssistantMessage {
 	return fauxAssistantMessage([fauxText(step.text)]);
 }
 
-/** Convert a session's assistant messages to faux steps. Thinking is dropped; empty messages are skipped. */
-export function toFauxSteps(messages: AgentSession["messages"]): FauxStep[] {
-	const steps: FauxStep[] = [];
-	for (const message of messages) {
-		if (message.role !== "assistant") continue;
-		const text = message.content
-			.filter((part) => part.type === "text")
-			.map((part) => part.text)
-			.join("\n");
-		const toolCalls = message.content
-			.filter((part) => part.type === "toolCall")
-			.map((part) => ({ name: part.name, args: part.arguments as Record<string, unknown> }));
-		if (toolCalls.length === 1 && !text) steps.push({ toolCall: toolCalls[0] });
-		else if (toolCalls.length > 0) steps.push(text ? { text, toolCalls } : { toolCalls });
-		else if (text) steps.push({ text });
-	}
-	return steps;
+/** Convert one assistant message to a faux step. Thinking is dropped; an empty message has no step. */
+export function toFauxStep(message: AgentSession["messages"][number]): FauxStep | undefined {
+	if (message.role !== "assistant") return undefined;
+	const text = message.content
+		.filter((part) => part.type === "text")
+		.map((part) => part.text)
+		.join("\n");
+	const toolCalls = message.content
+		.filter((part) => part.type === "toolCall")
+		.map((part) => ({ name: part.name, args: part.arguments as Record<string, unknown> }));
+	if (toolCalls.length === 1 && !text) return { toolCall: toolCalls[0] };
+	if (toolCalls.length > 0) return text ? { text, toolCalls } : { toolCalls };
+	return text ? { text } : undefined;
 }
 
 async function prepareModel(
@@ -107,7 +116,11 @@ async function prepareModel(
 	hostAgentDir: string,
 ): Promise<PreparedModel> {
 	if (!options.model) {
-		const faux = fauxProvider({ api: "faux", provider: "faux" });
+		const faux = fauxProvider({
+			api: "faux",
+			provider: "faux",
+			models: scenario.model ? [{ id: "faux-1", ...scenario.model }] : undefined,
+		});
 		faux.setResponses(scenario.faux.map(toAssistantMessage));
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("faux", async () => ({ type: "api_key", key: "scenario-only" }));
@@ -141,6 +154,24 @@ function isPriced(model: Model<Api>): boolean {
 	);
 }
 
+/** Inline extensions for the scenario's permission mode and fake Bus. */
+function scenarioExtensions(scenario: LoadedScenario, bus: ScenarioBus | undefined): InlineExtension[] {
+	const extensions: InlineExtension[] = [];
+	if (scenario.permissionMode) {
+		extensions.push({ name: "scenario-permissions", hidden: true, factory: (pi) => registerOctoberPermissions(pi) });
+	}
+	if (bus) {
+		const env = parseOctoberBusEnv({
+			OCTOBER_BUS_PORT: String(bus.port),
+			OCTOBER_BUS_CANVAS: "scenario-canvas",
+			OCTOBER_BUS_NODE: "scenario-node",
+		});
+		if (!env) throw new Error("Fake Bus environment was not recognized.");
+		extensions.push({ name: "scenario-bus", hidden: true, factory: (pi) => registerOctoberBusTools(pi, env) });
+	}
+	return extensions;
+}
+
 /**
  * Run one scenario in an isolated temp workspace and home. By default the scenario's scripted faux model
  * runs with no credentials or network; `options.model` runs a real model against the same checks instead.
@@ -153,6 +184,14 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 	const home = join(root, "home");
 	const agentDir = join(home, CONFIG_DIR_NAME, "agent");
 	const restoreEnvironment = applyIsolatedEnvironment(home, agentDir);
+	// The permission gate reads its mode from the environment when it registers.
+	const previousPermissionMode = process.env.OCTOBER_PERMISSION_MODE;
+	if (scenario.permissionMode) process.env.OCTOBER_PERMISSION_MODE = scenario.permissionMode;
+	else delete process.env.OCTOBER_PERMISSION_MODE;
+	let bus: ScenarioBus | undefined;
+	const compactions: Compaction[] = [];
+	// Every model request in order: assistant messages and compaction summaries, which are not session messages.
+	const transcript: FauxStep[] = [];
 	const toolExecutions: ToolExecution[] = [];
 	const errors: string[] = [];
 	let turns = 0;
@@ -162,7 +201,11 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 		await mkdir(agentDir, { recursive: true });
 
 		const { modelRuntime, model, pendingSteps } = await prepareModel(scenario, options, hostAgentDir);
-		const settingsManager = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
+		if (scenario.bus) bus = await startScenarioBus(scenario.bus.tools);
+		const settingsManager = SettingsManager.inMemory({
+			retry: { enabled: false },
+			compaction: scenario.compaction ? { enabled: true, ...scenario.compaction } : { enabled: false },
+		});
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: workspace,
 			agentDir,
@@ -172,6 +215,7 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true,
+			extensionFactories: scenarioExtensions(scenario, bus),
 		});
 		await resourceLoader.reload();
 		const { session } = await createAgentSession({
@@ -188,6 +232,14 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 		const unsubscribe = session.subscribe((event) => {
 			if (event.type === "tool_execution_end") toolExecutions.push({ name: event.toolName, isError: event.isError });
 			if (event.type === "turn_end") turns++;
+			if (event.type === "message_end") {
+				const step = toFauxStep(event.message);
+				if (step) transcript.push(step);
+			}
+			if (event.type === "compaction_end") {
+				compactions.push({ reason: event.reason, ok: !event.aborted && event.errorMessage === undefined });
+				if (event.result) transcript.push({ text: event.result.summary });
+			}
 		});
 
 		const startedAt = performance.now();
@@ -210,9 +262,10 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 			toolExecutions,
 			finalText: session.getLastAssistantText() ?? "",
 			turns,
+			compactions,
+			busCalls: bus?.calls ?? [],
 		});
 		const stats = session.getSessionStats();
-		const transcript = toFauxSteps(session.messages);
 		session.dispose();
 		return {
 			id: scenario.id,
@@ -235,6 +288,9 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 			},
 		};
 	} finally {
+		await bus?.close();
+		if (previousPermissionMode === undefined) delete process.env.OCTOBER_PERMISSION_MODE;
+		else process.env.OCTOBER_PERMISSION_MODE = previousPermissionMode;
 		restoreEnvironment();
 		await rm(root, { recursive: true, force: true });
 	}
