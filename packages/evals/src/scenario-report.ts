@@ -7,7 +7,9 @@ export const SCENARIO_REPORT_VERSION = 1;
 export type ScenarioReport = {
 	reportVersion: typeof SCENARIO_REPORT_VERSION;
 	createdAt: string;
-	mode: "faux";
+	mode: "faux" | "model";
+	/** `provider/id` of the model that ran every scenario. */
+	model: string;
 	passed: number;
 	total: number;
 	scenarios: ScenarioResult[];
@@ -17,7 +19,8 @@ export function buildScenarioReport(results: ScenarioResult[], createdAt = new D
 	return {
 		reportVersion: SCENARIO_REPORT_VERSION,
 		createdAt: createdAt.toISOString(),
-		mode: "faux",
+		mode: results[0]?.mode ?? "faux",
+		model: results[0]?.model ?? "faux/faux",
 		passed: results.filter((result) => result.passed).length,
 		total: results.length,
 		scenarios: results,
@@ -31,7 +34,7 @@ function cell(value: string): string {
 /** A concise Markdown summary: one row per scenario, then the failing checks and run errors. */
 export function formatScenarioMarkdown(report: ScenarioReport): string {
 	const lines = [
-		`# Scenario evals (${report.mode})`,
+		`# Scenario evals (${report.mode === "faux" ? "faux" : report.model})`,
 		"",
 		`${report.passed}/${report.total} scenarios passed.`,
 		"",

@@ -1,8 +1,17 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import {
+	type FauxProviderHandle,
+	fauxAssistantMessage,
+	fauxProvider,
+	fauxText,
+	fauxToolCall,
+	InMemoryCredentialStore,
+} from "@earendil-works/pi-ai";
+import { ModelRuntime } from "@october-dev/october";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { discoverScenarios, loadScenario } from "../src/scenario.ts";
+import { discoverScenarios, loadScenario, writeRecordedScenario } from "../src/scenario.ts";
 import { buildScenarioReport, formatScenarioMarkdown } from "../src/scenario-report.ts";
 import { runScenario } from "../src/scenario-runner.ts";
 
@@ -100,6 +109,68 @@ describe("scenario evals", () => {
 
 		expect(result.passed).toBe(true);
 		expect(readFileSync(join(tempDir, "s/workspace/a.txt"), "utf8")).toBe("old\n");
+	});
+
+	async function standInModel(steps: Parameters<FauxProviderHandle["setResponses"]>[0]) {
+		const standIn = fauxProvider({
+			api: "stand-in",
+			provider: "stand-in",
+			models: [{ id: "priced", cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }],
+		});
+		standIn.setResponses(steps);
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("stand-in", async () => ({ type: "api_key", key: "test-only" }));
+		const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
+		modelRuntime.registerNativeProvider(standIn.provider);
+		await modelRuntime.refresh({ allowNetwork: false });
+		return { model: { provider: "stand-in", id: "priced" }, modelRuntime };
+	}
+
+	it("runs a model instead of the faux script and records a replayable transcript", async () => {
+		// The scenario's own script is wrong, so a pass proves the selected model ran instead.
+		write("s/scenario.json", { ...renameScenario, faux: [{ text: "Doing nothing." }] });
+		write("s/workspace/a.txt", "old\n");
+		const scenario = await loadScenario(join(tempDir, "s"));
+		const options = await standInModel([
+			fauxAssistantMessage(
+				[
+					fauxText("Renaming now."),
+					fauxToolCall("edit", { path: "a.txt", edits: [{ oldText: "old", newText: "new" }] }),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Renamed."),
+		]);
+
+		const result = await runScenario(scenario, options);
+
+		expect(result).toMatchObject({ mode: "model", model: "stand-in/priced", passed: true, errors: [] });
+		expect(result.metrics.costUsd).toBe(0);
+		expect(result.transcript).toEqual([
+			{
+				text: "Renaming now.",
+				toolCalls: [{ name: "edit", args: { path: "a.txt", edits: [{ oldText: "old", newText: "new" }] } }],
+			},
+			{ text: "Renamed." },
+		]);
+
+		const recorded = await writeRecordedScenario(scenario, result.transcript, join(tempDir, "recorded"));
+		expect(recorded).toBe(join(tempDir, "recorded", "test", "rename"));
+		const replay = await runScenario(await loadScenario(recorded));
+		expect(replay).toMatchObject({ mode: "faux", passed: true, errors: [] });
+		expect(replay.metrics.costUsd).toBeNull();
+	});
+
+	it("rejects a model that is not configured", async () => {
+		write("s/scenario.json", renameScenario);
+		const { modelRuntime } = await standInModel([]);
+
+		await expect(
+			runScenario(await loadScenario(join(tempDir, "s")), {
+				model: { provider: "stand-in", id: "missing" },
+				modelRuntime,
+			}),
+		).rejects.toThrow("Scenario model not found: stand-in/missing");
 	});
 
 	it("rejects an invalid scenario with every problem path", async () => {

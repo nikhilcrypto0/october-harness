@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
@@ -16,15 +16,17 @@ export const SCENARIO_FORMAT_VERSION = 1;
 
 const Weight = Type.Optional(Type.Number({ exclusiveMinimum: 0 }));
 
+const ToolCallSchema = Type.Object(
+	{ name: Type.String({ minLength: 1 }), args: Type.Record(Type.String(), Type.Unknown()) },
+	{ additionalProperties: false },
+);
+
+/** One assistant message: text, one tool call, or several tool calls with optional text (as recorded). */
 const FauxStepSchema = Type.Union([
 	Type.Object({ text: Type.String() }, { additionalProperties: false }),
+	Type.Object({ toolCall: ToolCallSchema }, { additionalProperties: false }),
 	Type.Object(
-		{
-			toolCall: Type.Object(
-				{ name: Type.String({ minLength: 1 }), args: Type.Record(Type.String(), Type.Unknown()) },
-				{ additionalProperties: false },
-			),
-		},
+		{ text: Type.Optional(Type.String()), toolCalls: Type.Array(ToolCallSchema, { minItems: 1 }) },
 		{ additionalProperties: false },
 	),
 ]);
@@ -114,6 +116,24 @@ export async function loadScenario(directory: string): Promise<LoadedScenario> {
 		directory: resolve(directory),
 		workspaceDirectory: existsSync(workspace) ? resolve(workspace) : undefined,
 	};
+}
+
+/**
+ * Write `scenario` with `faux` replaced by `steps` under `root/<id>/`, copying its workspace fixture, so a
+ * recorded real-model run can be replayed deterministically. Returns the new scenario directory.
+ */
+export async function writeRecordedScenario(
+	scenario: LoadedScenario,
+	steps: FauxStep[],
+	root: string,
+): Promise<string> {
+	const directory = join(resolve(root), ...scenario.id.split("/"));
+	await mkdir(directory, { recursive: true });
+	const { directory: _source, workspaceDirectory, ...definition } = scenario;
+	const recorded: Scenario = { ...definition, faux: steps };
+	await writeFile(join(directory, "scenario.json"), `${JSON.stringify(recorded, null, "\t")}\n`);
+	if (workspaceDirectory) await cp(workspaceDirectory, join(directory, "workspace"), { recursive: true });
+	return directory;
 }
 
 /** Find every scenario directory (one containing `scenario.json`) under `root`, sorted by path. */
