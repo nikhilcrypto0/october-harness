@@ -1,0 +1,134 @@
+import { existsSync } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { type Static, Type } from "typebox";
+import { Compile } from "typebox/compile";
+
+/**
+ * Scenario format for deterministic harness evals (#15).
+ *
+ * A scenario is a directory with `scenario.json` and a `workspace/` fixture. The `faux` script is the
+ * default model, so a scenario runs with no credentials or network; `expect` scores the final state
+ * without an LLM judge.
+ */
+
+export const SCENARIO_FORMAT_VERSION = 1;
+
+const Weight = Type.Optional(Type.Number({ exclusiveMinimum: 0 }));
+
+const FauxStepSchema = Type.Union([
+	Type.Object({ text: Type.String() }, { additionalProperties: false }),
+	Type.Object(
+		{
+			toolCall: Type.Object(
+				{ name: Type.String({ minLength: 1 }), args: Type.Record(Type.String(), Type.Unknown()) },
+				{ additionalProperties: false },
+			),
+		},
+		{ additionalProperties: false },
+	),
+]);
+
+const CheckSchema = Type.Union([
+	Type.Object(
+		{
+			file: Type.String({ minLength: 1 }),
+			exists: Type.Optional(Type.Boolean()),
+			contains: Type.Optional(Type.String()),
+			notContains: Type.Optional(Type.String()),
+			matches: Type.Optional(Type.String()),
+			weight: Weight,
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			command: Type.String({ minLength: 1 }),
+			exitCode: Type.Optional(Type.Integer()),
+			outputContains: Type.Optional(Type.String()),
+			weight: Weight,
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			toolCalls: Type.Object(
+				{
+					name: Type.Optional(Type.String({ minLength: 1 })),
+					min: Type.Optional(Type.Integer({ minimum: 0 })),
+					max: Type.Optional(Type.Integer({ minimum: 0 })),
+					errors: Type.Optional(Type.Integer({ minimum: 0 })),
+				},
+				{ additionalProperties: false },
+			),
+			weight: Weight,
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{ finalText: Type.Object({ contains: Type.String() }, { additionalProperties: false }), weight: Weight },
+		{ additionalProperties: false },
+	),
+	Type.Object({ maxTurns: Type.Integer({ minimum: 1 }), weight: Weight }, { additionalProperties: false }),
+]);
+
+const ScenarioSchema = Type.Object(
+	{
+		formatVersion: Type.Literal(SCENARIO_FORMAT_VERSION),
+		id: Type.String({ pattern: "^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$" }),
+		description: Type.Optional(Type.String()),
+		prompt: Type.String({ minLength: 1 }),
+		tools: Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true }),
+		faux: Type.Array(FauxStepSchema, { minItems: 1 }),
+		expect: Type.Array(CheckSchema, { minItems: 1 }),
+	},
+	{ additionalProperties: false },
+);
+const checkScenario = Compile(ScenarioSchema);
+
+export type Scenario = Static<typeof ScenarioSchema>;
+export type ScenarioCheck = Static<typeof CheckSchema>;
+export type FauxStep = Static<typeof FauxStepSchema>;
+
+export type LoadedScenario = Scenario & {
+	/** Directory holding `scenario.json`. */
+	directory: string;
+	/** Fixture copied into a fresh temp workspace for each run; absent means an empty workspace. */
+	workspaceDirectory: string | undefined;
+};
+
+/** Load and validate one scenario directory. Throws with every schema problem, one per line. */
+export async function loadScenario(directory: string): Promise<LoadedScenario> {
+	const file = join(directory, "scenario.json");
+	const value: unknown = JSON.parse(await readFile(file, "utf8"));
+	if (!checkScenario.Check(value)) {
+		const problems = checkScenario
+			.Errors(value)
+			.map((error) => `  ${error.instancePath || "/"}: ${error.message}`)
+			.join("\n");
+		throw new Error(`Invalid scenario ${file}:\n${problems}`);
+	}
+	const workspace = join(directory, "workspace");
+	return {
+		...value,
+		directory: resolve(directory),
+		workspaceDirectory: existsSync(workspace) ? resolve(workspace) : undefined,
+	};
+}
+
+/** Find every scenario directory (one containing `scenario.json`) under `root`, sorted by path. */
+export async function discoverScenarios(root: string): Promise<string[]> {
+	const found: string[] = [];
+	const visit = async (directory: string): Promise<void> => {
+		if (existsSync(join(directory, "scenario.json"))) {
+			found.push(directory);
+			return;
+		}
+		for (const entry of await readdir(directory)) {
+			const child = join(directory, entry);
+			if ((await stat(child)).isDirectory()) await visit(child);
+		}
+	};
+	await visit(resolve(root));
+	return found.sort();
+}

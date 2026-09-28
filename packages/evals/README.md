@@ -16,8 +16,46 @@ Runner code lives in `src/`:
 - `plan.ts` expands cases into `(case, variant, repetition)` tasks
 - `report.ts` reads Vitest JSON, pairs arms, and computes lift
 - `harness.ts` is the vitest-evals adapter
+- `scenario.ts`, `scenario-runner.ts`, `scenario-checks.ts`, `scenario-report.ts`, and `scenario-cli.ts` run deterministic scenarios (see [Scenario evals](#scenario-evals))
 
-Eval suites and their fixtures live under `evals/`. Image build files live in `docker/`.
+Eval suites and their fixtures live under `evals/`. Deterministic scenarios live under `scenarios/`. Image build files live in `docker/`.
+
+## Scenario evals
+
+Scenario evals check harness behavior without credentials or network. Each run replays a scripted faux model against a copy of a fixture workspace, then scores the end state:
+
+```bash
+npm run eval:scenarios -w packages/evals
+```
+
+The command prints a Markdown summary and writes `scenarios.json` and `summary.md` under `.eval/`. It exits nonzero if any scenario fails. Pass `--scenarios <dir>` to run another pack, `--filter <text>` to select by path, and `--out <dir>` to choose the report directory.
+
+A scenario is a directory with `scenario.json` and an optional `workspace/` fixture:
+
+```json
+{
+	"formatVersion": 1,
+	"id": "core/command-failure-recovery",
+	"prompt": "Build the project so dist/out.txt exists.",
+	"tools": ["bash"],
+	"faux": [
+		{ "toolCall": { "name": "bash", "args": { "command": "node scripts/missing-build.js" } } },
+		{ "toolCall": { "name": "bash", "args": { "command": "node scripts/build.js" } } },
+		{ "text": "Built dist/out.txt after retrying." }
+	],
+	"expect": [
+		{ "file": "dist/out.txt", "contains": "ok" },
+		{ "toolCalls": { "name": "bash", "min": 2, "errors": 1 } }
+	]
+}
+```
+
+- `faux` is the scripted model: each step is one assistant message, either `text` or a `toolCall`. A run that stops before using every step is reported as an error.
+- `expect` lists the checks. `file` checks `exists`, `contains`, `notContains`, or a `matches` regex; `command` runs in the final workspace and checks `exitCode` and `outputContains`; `toolCalls` checks counts and errors, optionally for one tool; `finalText` checks the last assistant text; `maxTurns` bounds the turns. Each check takes an optional `weight` (default 1).
+- The score is the weighted share of passing checks. A scenario passes when every check passes and the run had no errors.
+- Faux usage is estimated, so cost is reported as `n/a`.
+
+Unknown fields are rejected, so a typo fails loading instead of silently skipping a check.
 
 ## Run evals
 
