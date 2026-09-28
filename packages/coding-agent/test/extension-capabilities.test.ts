@@ -137,6 +137,30 @@ describe("extension capability manifests", () => {
 			expect(readCapabilityManifest(entry)).toMatchObject({ status: "declared", manifest: fullManifest });
 		});
 
+		it("reads pi.capabilities for an entry matched by a pi.extensions glob", () => {
+			write("pkg/package.json", {
+				name: "pkg",
+				pi: { extensions: ["./extensions/*.ts"], capabilities: fullManifest },
+			});
+			const entry = write("pkg/extensions/foo.ts", "export default () => {}");
+			expect(readCapabilityManifest(entry)).toMatchObject({ status: "declared", manifest: fullManifest });
+		});
+
+		it("reads pi.capabilities for an entry under a directory matched by a glob", () => {
+			write("pkg/package.json", { name: "pkg", pi: { extensions: ["./plugins/*"], capabilities: fullManifest } });
+			const entry = write("pkg/plugins/tool/index.ts", "export default () => {}");
+			expect(readCapabilityManifest(entry)).toMatchObject({ status: "declared" });
+		});
+
+		it("does not attribute entries a glob does not match", () => {
+			write("pkg/package.json", {
+				name: "pkg",
+				pi: { extensions: ["./extensions/*.ts", "!./extensions/skip.ts"], capabilities: fullManifest },
+			});
+			const entry = write("pkg/other/bar.ts", "export default () => {}");
+			expect(readCapabilityManifest(entry)).toEqual({ status: "unclassified" });
+		});
+
 		it("does not use the conventional directory when pi.extensions lists other entries", () => {
 			write("pkg/package.json", { name: "pkg", pi: { extensions: ["./src/main.ts"], capabilities: fullManifest } });
 			const entry = write("pkg/extensions/other.ts", "export default () => {}");
@@ -202,6 +226,31 @@ describe("extension capability manifests", () => {
 			expect(result.errors).toHaveLength(0);
 			expect(result.extensions).toHaveLength(1);
 			expect(fs.existsSync(marker)).toBe(true);
+		});
+
+		it("blocks a glob-listed package extension whose manifest is invalid", async () => {
+			const marker = path.join(tempDir, "executed.txt");
+			const pkgDir = path.join(tempDir, "pkg");
+			write("pkg/package.json", {
+				name: "pkg",
+				pi: { extensions: ["./extensions/*.ts"], capabilities: { manifestVersion: 2 } },
+			});
+			const entry = write("pkg/extensions/foo.ts", markerExtension(marker));
+			const settingsManager = SettingsManager.inMemory();
+			settingsManager.setPackages([pkgDir]);
+			const packageManager = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir: path.join(tempDir, "agent"),
+				settingsManager,
+			});
+
+			const resolved = await packageManager.resolve();
+			expect(resolved.extensions.map((resource) => resource.path)).toEqual([entry]);
+			const result = await discoverAndLoadExtensions([entry], tempDir, path.join(tempDir, "agent"));
+
+			expect(result.extensions).toHaveLength(0);
+			expect(result.errors[0]?.error).toContain("manifestVersion: must be 1");
+			expect(fs.existsSync(marker)).toBe(false);
 		});
 
 		it("keeps a convention-layout package's extensions when it declares pi.capabilities", async () => {

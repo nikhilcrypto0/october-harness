@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { minimatch } from "minimatch";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
@@ -96,6 +97,23 @@ function isWithin(child: string, parent: string): boolean {
 }
 
 /**
+ * Whether a `pi.extensions` entry covers an extension entry file. Like the package manager, a glob entry
+ * matches paths relative to the package root; a match on the file or any directory above it counts, since
+ * matched directories are searched for extensions. Override entries (`!`, `+`, `-`) only filter and own nothing.
+ */
+function coversEntry(root: string, manifestEntry: string, entryPath: string): boolean {
+	if (/^[!+-]/.test(manifestEntry)) return false;
+	if (!manifestEntry.includes("*") && !manifestEntry.includes("?")) {
+		return isWithin(entryPath, path.resolve(root, manifestEntry));
+	}
+	const pattern = path.posix.normalize(manifestEntry.split(path.sep).join("/"));
+	for (let candidate = entryPath; candidate !== root && isWithin(candidate, root); candidate = path.dirname(candidate)) {
+		if (minimatch(path.relative(root, candidate).split(path.sep).join("/"), pattern, { dot: true })) return true;
+	}
+	return false;
+}
+
+/**
  * Find the package that owns an extension entry: the nearest package.json with a `pi` field whose
  * `pi.extensions` lists the entry (or a directory containing it), or, without `pi.extensions`, whose
  * conventional `extensions/` directory contains it. An entry directly in the package root also belongs to
@@ -108,8 +126,11 @@ function findOwningPackage(entryPath: string): { packageJsonPath: string; capabi
 		if (existsSync(packageJsonPath)) {
 			const manifest = readPiManifest(packageJsonPath);
 			if (!manifest) return undefined;
-			const roots = manifest.extensions?.map((entry) => path.resolve(dir, entry)) ?? [path.join(dir, "extensions")];
-			const owned = path.dirname(entryPath) === dir || roots.some((root) => isWithin(entryPath, root));
+			const owned =
+				path.dirname(entryPath) === dir ||
+				(manifest.extensions
+					? manifest.extensions.some((entry) => coversEntry(dir, entry, entryPath))
+					: isWithin(entryPath, path.join(dir, "extensions")));
 			return owned ? { packageJsonPath, capabilities: manifest.capabilities } : undefined;
 		}
 		const parent = path.dirname(dir);
