@@ -243,6 +243,126 @@ Entries normally form one tree, but navigation APIs can create multiple roots:
 
 The compaction summary replaces entries before `firstKeptEntryId`. Pre-compaction system messages are folded into the complete checkpoint rather than replayed from the retained range. Retained non-system entries and all entries after the compaction remain available to the LLM.
 
+## Portable Sessions
+
+A portable session moves a conversation between machines and entry points (CLI, RPC, SDK). Its structured fields carry no harness credentials, provider replay secrets, or source-machine path fields. Transcript content is not redacted: message text, tool arguments, and command output are kept verbatim and can contain paths or secrets (see [Security boundary](#security-boundary)). Native session files stay the storage format; a portable file is an interchange copy.
+
+| Entry point | Export | Import |
+|-------------|--------|--------|
+| CLI | `--export <session.jsonl> <out>.jsonl` | `--import <portable.jsonl>` |
+| Interactive | `/export <out>.jsonl` | `/import <portable.jsonl>` |
+| RPC | [`export_jsonl`](rpc-commands.md#export_jsonl) | [`import_jsonl`](rpc-commands.md#import_jsonl) |
+| SDK | `session.exportToJsonl()`, `exportPortableSession()`, `serializePortableSession()` | `runtime.importPortable()`, `importPortableSession()` |
+
+### Format
+
+A portable file is JSONL v3 with a `portable: 1` marker in the header:
+
+```json
+{"type":"session","version":3,"portable":1,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z"}
+```
+
+- The header has exactly these five fields. `cwd` and `parentSession` are excluded.
+- Only the active branch is exported: the path from the root to the current leaf. Entries on other branches are left out and reported once with a count.
+- Entries keep their `type`, original `id`, and original `timestamp`, in path order. `parentId` is re-chained to the previous exported entry, so the file is one linear path and its last entry is the leaf.
+- The session `id` and header `timestamp` are kept. Importing restores the same session id.
+
+### Fields
+
+Each entry is built field by field from this allowlist. Anything else present in the source is left out and reported.
+
+| Entry | Kept | Excluded |
+|-------|------|----------|
+| Header | `type`, `version`, `portable`, `id`, `timestamp` | `cwd`, `parentSession` |
+| `message` user | `role`, `content` (string, or `text`/`image` blocks), `timestamp` | `textSignature` |
+| `message` assistant | `role`, `content`, `api`, `provider`, `model`, `responseModel?`, `providerThinkingLevel?`, `usage`, `stopReason`, `endTurn?`, `timestamp` | `textSignature`, `thinkingSignature`, `thoughtSignature`, redacted thinking blocks, `responseId`, `deferred`, `diagnostics`, `errorMessage`, `rawStopReason` |
+| `message` assistant with `stopReason` `pending` or `deferred` | nothing | the whole entry |
+| `message` toolResult | `role`, `toolCallId`, `toolName`, `content` (`text`/`image`), `isError`, `usage?`, `timestamp` | `details` |
+| `message` bashExecution | `role`, `command`, `output`, `exitCode?`, `cancelled`, `truncated`, `excludeFromContext?`, `timestamp` | `fullOutputPath` |
+| `message` system | nothing | the whole entry |
+| `compaction` | `summary`, `firstKeptEntryId`, `tokensBefore`, `usage?`, `fromHook?` | `details`, `systemMessage` |
+| `branch_summary` | `fromId`, `summary`, `usage?`, `fromHook?` | `details` |
+| `custom_message` | `customType`, `content` (string, or `text`/`image` blocks), `display` | `details` |
+| `context_edit` | `targetId`, `replacement` (`null` or `{ content }` with the target role's content rules) | fields the target role excludes |
+| `model_change` | `provider`, `modelId` | - |
+| `thinking_level_change` | `thinkingLevel` | - |
+| `usage` | `kind`, `provider`, `model`, `usage` | `note` |
+| `session_info` | `name?` | - |
+| `label` | `targetId`, `label?` | - |
+| `custom` | nothing | the whole entry |
+| Any other entry type, message role, or content block | nothing | the whole value |
+
+Content blocks keep only their content fields: `text` keeps `type`/`text`; non-redacted `thinking` keeps `type`/`thinking`; `toolCall` keeps `type`/`id`/`name`/`arguments`/`namespace?`; `image` keeps `type`/`mimeType`/`data` in its original position. Image blocks are how attachments are stored, so attachments round-trip inline.
+
+Legacy or hand-built sessions can hold missing or `null` content, or string content on assistant and tool-result messages. Export writes these as content blocks (`[]`, or one `text` block), which is how native loading and context building already treat them, and reports each as `normalized_value`.
+
+Why these exclusions:
+
+- **Signatures and redacted thinking** are opaque provider state tied to an account. Providers already handle messages without them; the loss is same-model reasoning replay.
+- **`details`, `custom.data`** are untyped extension data that can hold paths or secrets. They are not sent to the model.
+- **`errorMessage`, `rawStopReason`, `usage.note`** are free-form provider or extension text. `stopReason` stays, so a failed turn is still recorded as failed.
+- **System messages and `compaction.systemMessage`** describe the source prompt and tools. The destination declares its own prompt and tools on the next request.
+- **`fullOutputPath`** is a source-machine path. The destination context therefore has no `[Output truncated. Full output: <path>]` footer for that bash message; `truncated: true` is kept.
+- **Unsettled assistant turns** need their excluded provider handle to resume.
+
+### References
+
+Entry ids are never rewritten.
+
+- `compaction.firstKeptEntryId` that names an excluded entry moves to the next exported entry before the compaction. With no such entry, or when the value is missing or names no earlier entry on the path (legacy v1 sessions), it becomes the compaction's own id, which means "retain nothing before the compaction". Both keep the retained context unchanged and are reported as `remapped_reference`.
+- A `label` or `context_edit` whose target is not exported is dropped and reported.
+- `branch_summary.fromId` is provenance only. It usually names an entry on the abandoned branch and is not checked.
+- Tool results are not matched against earlier tool calls, as in native sessions.
+
+### Diagnostics
+
+Export returns every excluded or changed value:
+
+```typescript
+interface PortableSessionDiagnostic {
+  code: "excluded_field" | "excluded_entry" | "inactive_branch" | "normalized_value" | "remapped_reference";
+  entryId?: string; // absent for header and branch-level items
+  field: string;    // e.g. "header.cwd", "assistant.content.thinkingSignature", "custom"
+  message: string;
+}
+```
+
+Order is header diagnostics, then the `inactive_branch` count, then entries in path order and content order. SDK and RPC return the full list. The CLI and interactive mode print one line per `code` and `field` with a count.
+
+### Import
+
+Import has no lossy mode. It accepts exactly the contract above or fails with `PortableSessionError`, which carries a stable `code`, the physical `line`, a JSON `path`, and a message with both:
+
+```
+Invalid portable session /tmp/portable.jsonl (line 4, $.message.content[0].thinkingSignature): unexpected field
+```
+
+- Every non-blank line must be JSON. The first record must be the only header, with `portable: 1`, `version: 3`, a valid session id, and a string timestamp. A file without the marker is rejected; open native session files with `--session` or `switch_session` instead.
+- Unknown entry types, roles, blocks, and fields are rejected, not stripped.
+- Ids must be unique, the path must be linear, and `firstKeptEntryId` and `targetId` must name earlier entries.
+- If the session directory already holds a file with the same session id, import fails with `SessionImportIdConflictError`. This includes the portable file itself when it sits in the session directory.
+
+These rejections happen before anything is written or the active session changes, and all extend `SessionImportError`: an invalid file (`PortableSessionError`), a session id conflict (`SessionImportIdConflictError`), a missing input file (`SessionImportFileNotFoundError`), and importing into a runtime with session persistence disabled (`--no-session`). A `session_before_switch` handler can also cancel the import before anything is written; the import then returns `{ cancelled: true }`.
+
+Failures after validation are not transactional. A filesystem error while creating the session directory or writing the file is thrown as is and can leave the new directory behind. If the runtime fails to start the imported session after the file is written, the file stays in the session directory.
+
+On success, import writes a new native session `<sessionDir>/<import-time>_<id>.jsonl` whose header has the destination `cwd` and no marker, followed by the validated entries. The input file is never opened in place or modified, and nothing is written when validation fails. Reopening the new file resumes at the exported leaf.
+
+### Security boundary
+
+The portable structure (header, entry fields, message fields) contains no harness credentials, provider replay secrets, or source-machine path fields. Transcript content is kept verbatim: message text, tool-call arguments, tool-result text, bash `command`/`output`, and summaries. That content can still contain paths or secrets written by the user, the model, a tool, or the harness, such as a bash tool result's `Full output: <path>` text or the file lists in a compaction summary. Review a portable file before sharing it.
+
+### Deliberate losses
+
+- Same-model reasoning replay (signatures and redacted thinking). A session exported between a Gemini 3 tool call and its answer loses the call's `thoughtSignature`; the provider may reject the continued request, as after a mid-turn model switch.
+- Extension state (`custom` entries) and tool render metadata (`details`).
+- The source prompt and tool loadout.
+- Inactive branches.
+- Provider error text and raw stop reasons.
+- Usage notice qualifiers.
+- The truncated-output footer of `!` bash messages.
+- Unsettled (`pending`/`deferred`) assistant turns.
+
 ## Parsing Example
 
 ```typescript

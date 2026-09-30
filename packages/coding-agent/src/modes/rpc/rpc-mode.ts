@@ -602,6 +602,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "export_html", { path });
 			}
 
+			case "export_jsonl": {
+				return success(id, "export_jsonl", session.exportToJsonl(command.outputPath));
+			}
+
+			case "import_jsonl": {
+				// The runtime rebinds through setRebindSession() when it replaces the session.
+				return success(id, "import_jsonl", await runtimeHost.importPortable(command.inputPath));
+			}
+
 			case "switch_session": {
 				const result = await runtimeHost.switchSession(command.sessionPath);
 				if (!result.cancelled) {

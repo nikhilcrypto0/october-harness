@@ -583,6 +583,48 @@ Response:
 }
 ```
 
+### export_jsonl
+
+Export the active branch as a [portable session](session-format.md#portable-sessions) file. Without `outputPath`, writes a timestamped file in the process cwd.
+
+```json
+{"type": "export_jsonl", "outputPath": "/tmp/portable.jsonl"}
+```
+
+Response. `diagnostics` lists every excluded or changed value:
+```json
+{
+  "type": "response",
+  "command": "export_jsonl",
+  "success": true,
+  "data": {
+    "path": "/tmp/portable.jsonl",
+    "diagnostics": [
+      {"code": "excluded_field", "field": "header.cwd", "message": "machine-specific path"},
+      {"code": "excluded_field", "entryId": "a1b2c3d4", "field": "assistant.content.thinkingSignature", "message": "provider replay signature"}
+    ]
+  }
+}
+```
+
+### import_jsonl
+
+Import a portable session file as a new session in the current cwd and switch to it. Only files with the portable header marker are accepted; use `switch_session` for native session files. Can be canceled by a `session_before_switch` extension event handler.
+
+```json
+{"type": "import_jsonl", "inputPath": "/tmp/portable.jsonl"}
+```
+
+Response:
+```json
+{"type": "response", "command": "import_jsonl", "success": true, "data": {"cancelled": false}}
+```
+
+Invalid files, native files, and session id conflicts fail without writing anything. The error names the line and JSON path:
+```json
+{"type": "response", "command": "import_jsonl", "success": false, "error": "Invalid portable session /tmp/portable.jsonl (line 4, $.message.errorMessage): unexpected field"}
+```
+
 ### switch_session
 
 Load a different session file. Can be canceled by a `session_before_switch` extension event handler.

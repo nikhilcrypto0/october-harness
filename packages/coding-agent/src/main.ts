@@ -5,6 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
@@ -57,7 +58,12 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import { assertValidSessionId, getDefaultSessionDirPath, SessionManager } from "./core/session-manager.ts";
+import {
+	exportPortableSession,
+	formatPortableSessionDiagnostics,
+	importPortableSession,
+} from "./core/session-portable.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
@@ -313,6 +319,32 @@ function validateForkFlags(parsed: Args): void {
 	}
 }
 
+/**
+ * Report --import conflicts. Returns false when main() should stop.
+ *
+ * The portable import and export paths end main() with process.exitCode instead of process.exit(),
+ * because a hard exit can drop pending writes when stdout/stderr are non-blocking pipes.
+ */
+function validateImportFlags(parsed: Args): boolean {
+	if (parsed.import === undefined) return true;
+
+	const conflictingFlags = [
+		parsed.session ? "--session" : undefined,
+		parsed.sessionId ? "--session-id" : undefined,
+		parsed.continue ? "--continue" : undefined,
+		parsed.resume ? "--resume" : undefined,
+		parsed.fork ? "--fork" : undefined,
+		parsed.noSession ? "--no-session" : undefined,
+		parsed.export ? "--export" : undefined,
+	].filter((flag): flag is string => flag !== undefined);
+
+	if (conflictingFlags.length > 0) {
+		console.error(chalk.red(`Error: --import cannot be combined with ${conflictingFlags.join(", ")}`));
+		return false;
+	}
+	return true;
+}
+
 function validateResumeIdFlags(parsed: Args): void {
 	if (parsed.resumeId === undefined) return;
 
@@ -379,6 +411,16 @@ export async function createSessionManager(
 ): Promise<SessionManager> {
 	if (parsed.noSession || parsed.help || parsed.listModels !== undefined) {
 		return SessionManager.inMemory(cwd, parsed.sessionId !== undefined ? { id: parsed.sessionId } : undefined);
+	}
+
+	if (parsed.import) {
+		// A path only: commitPortableImport() creates the directory after validation succeeds.
+		// Errors propagate to main(), which reports them and ends with process.exitCode.
+		const importedPath = importPortableSession(parsed.import, {
+			cwd,
+			sessionDir: sessionDir ?? getDefaultSessionDirPath(cwd),
+		});
+		return SessionManager.open(importedPath, sessionDir);
 	}
 
 	if (parsed.fork) {
@@ -669,18 +711,37 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
+	// --export exits before the other session flag checks, so check its --import conflict first.
+	if (!validateImportFlags(parsed)) {
+		process.exitCode = 1;
+		return;
+	}
+
 	if (parsed.export) {
 		let result: string;
 		try {
 			const outputPath = parsed.messages.length > 0 ? parsed.messages[0] : undefined;
-			result = await exportFromFile(parsed.export, outputPath);
+			if (outputPath?.endsWith(".jsonl")) {
+				const inputPath = resolvePath(parsed.export);
+				if (!existsSync(inputPath)) {
+					throw new Error(`File not found: ${inputPath}`);
+				}
+				const exported = exportPortableSession(SessionManager.open(inputPath), outputPath);
+				for (const line of formatPortableSessionDiagnostics(exported.diagnostics)) {
+					console.error(chalk.dim(line));
+				}
+				result = exported.path;
+			} else {
+				result = await exportFromFile(parsed.export, outputPath);
+			}
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : "Failed to export session";
 			console.error(chalk.red(`Error: ${message}`));
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 		console.log(`Exported to: ${result}`);
-		process.exit(0);
+		return;
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
@@ -737,7 +798,16 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	let sessionManager: SessionManager;
+	try {
+		sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	} catch (error: unknown) {
+		// Only --import failures are reported here; other errors keep their existing handling.
+		if (!parsed.import) throw error;
+		console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
+		process.exitCode = 1;
+		return;
+	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {

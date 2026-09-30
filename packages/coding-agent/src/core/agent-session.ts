@@ -109,7 +109,6 @@ import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import { exportSessionToJsonl } from "./session-export.ts";
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
@@ -118,6 +117,7 @@ import {
 	type SessionEntry,
 	SessionManager,
 } from "./session-manager.ts";
+import { exportPortableSession, type PortableSessionExportResult } from "./session-portable.ts";
 import type { CacheWarmingMode, SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -3926,13 +3926,14 @@ export class AgentSession {
 	}
 
 	/**
-	 * Export the current session branch to a JSONL file.
-	 * Writes the session header followed by all entries on the current branch path.
+	 * Export the current session branch as a portable session JSONL file.
+	 * Credentials, provider replay state, and machine-specific paths are excluded; see
+	 * docs/session-format.md "Portable Sessions".
 	 * @param outputPath Target file path. If omitted, generates a timestamped file in cwd.
-	 * @returns The resolved output file path.
+	 * @returns The resolved output file path and every excluded or changed value.
 	 */
-	exportToJsonl(outputPath?: string): string {
-		return exportSessionToJsonl(this.sessionManager, outputPath);
+	exportToJsonl(outputPath?: string): PortableSessionExportResult {
+		return exportPortableSession(this.sessionManager, outputPath);
 	}
 
 	/**

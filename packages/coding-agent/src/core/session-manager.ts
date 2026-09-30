@@ -583,10 +583,10 @@ export function buildSessionContext(
 }
 
 /**
- * Compute the default session directory for a cwd.
+ * Compute the default session directory for a cwd without creating it.
  * Encodes cwd into a safe directory name under ~/.pi/agent/sessions/.
  */
-function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgentDir()): string {
+export function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgentDir()): string {
 	const resolvedCwd = resolvePath(cwd);
 	const resolvedAgentDir = resolvePath(agentDir);
 	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
@@ -1884,6 +1884,22 @@ export class SessionManager {
 			}
 		} catch {
 			// Exact session discovery is best-effort, matching list().
+		}
+		return undefined;
+	}
+
+	/**
+	 * Find a session file with an exact ID in one directory, regardless of its header cwd.
+	 * Unlike findById(), headers without a cwd match too.
+	 * @returns The first matching file, or undefined when none matches or the directory does not exist.
+	 */
+	static findByIdInDirectory(sessionDir: string, id: string): string | undefined {
+		const dir = normalizePath(sessionDir);
+		if (!existsSync(dir)) return undefined;
+		for (const file of readdirSync(dir)) {
+			if (!file.endsWith(".jsonl")) continue;
+			const path = join(dir, file);
+			if (readSessionHeaderForDiscovery(path)?.id === id) return path;
 		}
 		return undefined;
 	}

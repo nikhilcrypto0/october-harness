@@ -55,7 +55,9 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 `session.dispose()` aborts active work, invalidates extension contexts, disconnects from the agent, and removes event listeners. Call it when the session is no longer needed.
 
-`AgentSessionRuntime` adds `newSession()`, `switchSession()`, `fork()`, and `importFromJsonl()`. Each operation replaces the active `AgentSession` and recreates services for the target working directory.
+`AgentSessionRuntime` adds `newSession()`, `switchSession()`, `fork()`, `importPortable()`, and `importFromJsonl()`. Each operation replaces the active `AgentSession` and recreates services for the target working directory.
+
+To move a session between machines or entry points, use [portable sessions](session-format.md#portable-sessions). `session.exportToJsonl(path)` writes the active branch and returns `{ path, diagnostics }`. `runtime.importPortable(path)` accepts only portable files and imports into the runtime's cwd. `runtime.importFromJsonl(path)` accepts both: portable files go through `importPortable()`, and other session files are copied into the session directory unchanged and opened with their header cwd. Without a runtime, `importPortableSession(path, { cwd, sessionDir })` writes the native session and returns its path for `SessionManager.open()`.
 
 After a runtime replacement, subscriptions belong to the old `AgentSession` and must be rebound. See the [session runtime example](../examples/sdk/13-session-runtime.ts).
 

@@ -5,16 +5,20 @@ import { setupCli } from "./cli/setup.ts";
 import { main } from "./main.ts";
 import { launchOctoberTeam } from "./october-team-launcher.ts";
 
+const args = process.argv.slice(2);
+let teamExitCode: number | undefined;
 try {
-	const args = process.argv.slice(2);
-	const teamExitCode = await launchOctoberTeam(args);
-	if (teamExitCode === undefined) {
-		setupCli();
-		main(args);
-	} else {
-		process.exitCode = teamExitCode;
-	}
+	teamExitCode = await launchOctoberTeam(args);
 } catch (error) {
 	console.error(`october --team: ${error instanceof Error ? error.message : String(error)}`);
-	process.exitCode = 1;
+	teamExitCode = 1;
+}
+
+if (teamExitCode === undefined) {
+	setupCli();
+	// Awaited so the entry point owns main()'s whole output lifecycle. main() failures stay outside
+	// the --team error boundary above.
+	await main(args);
+} else {
+	process.exitCode = teamExitCode;
 }
