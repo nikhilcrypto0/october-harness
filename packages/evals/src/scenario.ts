@@ -208,6 +208,8 @@ export async function discoverScenarios(root: string): Promise<string[]> {
 			return;
 		}
 		for (const entry of await readdir(directory)) {
+			// Skip dependencies, reports, and other hidden directories such as `.eval`.
+			if (entry === "node_modules" || entry.startsWith(".")) continue;
 			const child = join(directory, entry);
 			if ((await stat(child)).isDirectory()) await visit(child);
 		}

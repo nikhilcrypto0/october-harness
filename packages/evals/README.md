@@ -22,13 +22,16 @@ Eval suites and their fixtures live under `evals/`. Deterministic scenarios live
 
 ## Scenario evals
 
-Scenario evals check harness behavior without credentials or network. Each run replays a scripted faux model against a copy of a fixture workspace, then scores the end state:
+Scenario evals check harness behavior without credentials or network. Each run replays a scripted faux model against a copy of a fixture workspace, then scores the end state. The runner imports built packages, so build once after `npm ci`:
 
 ```bash
+npm run build
 npm run eval:scenarios -w packages/evals
 ```
 
-The command prints a Markdown summary and writes `scenarios.json` and `summary.md` under `.eval/`. It exits nonzero if any scenario fails. Pass `--scenarios <dir>` (repeatable) to run other packs instead of the bundled one, `--filter <text>` to select by path, and `--out <dir>` to choose the report directory.
+The command prints a Markdown summary and writes `scenarios.json` and `summary.md` under `.eval/`. It exits nonzero if any scenario fails, and a scenario that cannot load or run is reported as a failure instead of stopping the others.
+
+During a run, tools see only a minimal environment (`PATH`, the temporary home, locale and temp directories), so a scenario cannot read provider keys or other host secrets. Scenarios run one at a time because each run changes the process environment. Pass `--scenarios <dir>` (repeatable) to run other packs instead of the bundled one, `--filter <text>` to select by path, and `--out <dir>` to choose the report directory.
 
 ### Run against a real model
 
@@ -38,7 +41,9 @@ The same scenarios run against any configured model. The `faux` script is ignore
 npm run eval:scenarios -w packages/evals -- --provider anthropic --model claude-sonnet-5
 ```
 
-Credentials come from the host's stored login or environment, as for other evals. Add `--record <dir>` to save each run's assistant messages as a new scenario pack with the same prompt, fixture and checks. Compaction summaries are recorded in place, so a run that compacts still replays in order. A compaction that makes two summary requests (a split turn with earlier history) is recorded as one step and will not replay exactly. The recorded pack then replays with no credentials:
+**A real-model run executes the commands the model chooses, on this machine.** The workspace is a temporary copy and provider keys are hidden from tools, but `bash` and other tools still run on the host with your user's permissions. Run real-model evals only with models and scenario packs you trust, or inside a container.
+
+Credentials come from the host's stored login or environment, as for other evals, and are resolved before the run starts. Add `--record <dir>` to save each run's assistant messages as a new scenario pack with the same prompt, fixture and checks. Compaction summaries are recorded in place, so a run that compacts still replays in order. A compaction that makes two summary requests (a split turn with earlier history) is recorded as one step and will not replay exactly. The recorded pack then replays with no credentials:
 
 ```bash
 npm run eval:scenarios -w packages/evals -- --provider anthropic --model claude-sonnet-5 --record recorded/

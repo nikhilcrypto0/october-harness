@@ -21,7 +21,6 @@ import {
 	getAgentDir,
 	type InlineExtension,
 	ModelRuntime,
-	readStoredCredential,
 	SessionManager,
 	SettingsManager,
 } from "@october-dev/october";
@@ -29,8 +28,11 @@ import {
 // exactly as the `october` extension registers them.
 import { parseOctoberBusEnv } from "../../coding-agent/src/extensions/october/bus/env.ts";
 import { registerOctoberBusTools } from "../../coding-agent/src/extensions/october/bus/tools.ts";
-import { registerOctoberPermissions } from "../../coding-agent/src/extensions/october/permissions.ts";
-import { applyIsolatedEnvironment } from "./harness.ts";
+import {
+	createOctoberPermissionController,
+	registerOctoberPermissions,
+} from "../../coding-agent/src/extensions/october/permissions.ts";
+import { applyIsolatedEnvironment, hasPricing, resolveEvalModel } from "./harness.ts";
 import type { FauxStep, LoadedScenario } from "./scenario.ts";
 import { type ScenarioBus, startScenarioBus } from "./scenario-bus.ts";
 import {
@@ -129,36 +131,80 @@ async function prepareModel(
 		await modelRuntime.refresh({ allowNetwork: false });
 		return { modelRuntime, model: faux.getModel(), pendingSteps: () => faux.getPendingResponseCount() };
 	}
-	const { provider, id } = options.model;
-	let modelRuntime = options.modelRuntime;
-	let storedCredential: ReturnType<typeof readStoredCredential> | undefined;
-	if (!modelRuntime) {
-		const credentials = new InMemoryCredentialStore();
-		storedCredential = readStoredCredential(provider, join(hostAgentDir, "auth.json"));
-		if (storedCredential) await credentials.modify(provider, async () => storedCredential!);
-		modelRuntime = await ModelRuntime.create({ credentials });
-	}
-	const model = modelRuntime.getModel(provider, id);
-	if (!model) throw new Error(`Scenario model not found: ${provider}/${id}`);
-	const auth = await modelRuntime.getAuth(model);
-	if (!auth) throw new Error(`Scenario model has no configured authentication: ${provider}/${id}`);
-	if (!options.modelRuntime && !storedCredential && auth.auth.apiKey) {
-		await modelRuntime.setRuntimeApiKey(provider, auth.auth.apiKey);
-	}
+	const { modelRuntime, model } = await resolveEvalModel(options.model, hostAgentDir, {
+		label: "Scenario",
+		modelRuntime: options.modelRuntime,
+	});
 	return { modelRuntime, model, pendingSteps: () => undefined };
 }
 
-function isPriced(model: Model<Api>): boolean {
-	return [model.cost, ...(model.cost.tiers ?? [])].some(
-		({ input, output, cacheRead, cacheWrite }) => input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0,
-	);
+/**
+ * Environment variables a run may see. Everything else, including provider keys, is hidden from tools
+ * during the run; credentials are resolved into the model runtime before it starts.
+ */
+const RUN_ENVIRONMENT = [
+	"PATH",
+	"HOME",
+	"USERPROFILE",
+	"OCTOBER_CODING_AGENT_DIR",
+	"TMPDIR",
+	"TEMP",
+	"TMP",
+	"LANG",
+	"LC_ALL",
+	"TERM",
+	"SHELL",
+	"SystemRoot",
+	"ComSpec",
+	"PATHEXT",
+];
+
+/** Reduce `process.env` to `RUN_ENVIRONMENT`; the returned function restores the full environment. */
+function restrictEnvironment(): () => void {
+	const saved = { ...process.env };
+	for (const name of Object.keys(process.env)) {
+		if (!RUN_ENVIRONMENT.includes(name)) delete process.env[name];
+	}
+	return () => {
+		for (const name of Object.keys(process.env)) delete process.env[name];
+		Object.assign(process.env, saved);
+	};
+}
+
+/** A failed result for a scenario that could not load or run, so one failure does not hide the others. */
+export function erroredResult(id: string, error: unknown, model?: ScenarioModelSelection): ScenarioResult {
+	return {
+		id,
+		mode: model ? "model" : "faux",
+		model: model ? `${model.provider}/${model.id}` : "faux/faux",
+		score: 0,
+		passed: false,
+		checks: [],
+		errors: [`Scenario could not run: ${error instanceof Error ? error.message : String(error)}`],
+		transcript: [],
+		metrics: {
+			turns: 0,
+			toolCalls: 0,
+			toolErrors: 0,
+			inputTokens: 0,
+			outputTokens: 0,
+			totalTokens: 0,
+			costUsd: null,
+			durationMs: 0,
+		},
+	};
 }
 
 /** Inline extensions for the scenario's permission mode and fake Bus. */
 function scenarioExtensions(scenario: LoadedScenario, bus: ScenarioBus | undefined): InlineExtension[] {
 	const extensions: InlineExtension[] = [];
 	if (scenario.permissionMode) {
-		extensions.push({ name: "scenario-permissions", hidden: true, factory: (pi) => registerOctoberPermissions(pi) });
+		const mode = scenario.permissionMode;
+		extensions.push({
+			name: "scenario-permissions",
+			hidden: true,
+			factory: (pi) => registerOctoberPermissions(pi, createOctoberPermissionController(), { mode }),
+		});
 	}
 	if (bus) {
 		const env = parseOctoberBusEnv({
@@ -175,6 +221,8 @@ function scenarioExtensions(scenario: LoadedScenario, bus: ScenarioBus | undefin
 /**
  * Run one scenario in an isolated temp workspace and home. By default the scenario's scripted faux model
  * runs with no credentials or network; `options.model` runs a real model against the same checks instead.
+ *
+ * Runs change the global `process.env` while they execute, so run scenarios one at a time, never in parallel.
  */
 export async function runScenario(scenario: LoadedScenario, options: RunScenarioOptions = {}): Promise<ScenarioResult> {
 	// Read before isolating the environment, which points the agent dir at the temp home.
@@ -184,10 +232,8 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 	const home = join(root, "home");
 	const agentDir = join(home, CONFIG_DIR_NAME, "agent");
 	const restoreEnvironment = applyIsolatedEnvironment(home, agentDir);
-	// The permission gate reads its mode from the environment when it registers.
-	const previousPermissionMode = process.env.OCTOBER_PERMISSION_MODE;
-	if (scenario.permissionMode) process.env.OCTOBER_PERMISSION_MODE = scenario.permissionMode;
-	else delete process.env.OCTOBER_PERMISSION_MODE;
+	let restoreRunEnvironment: (() => void) | undefined;
+	let session: AgentSession | undefined;
 	let bus: ScenarioBus | undefined;
 	const compactions: Compaction[] = [];
 	// Every model request in order: assistant messages and compaction summaries, which are not session messages.
@@ -201,6 +247,7 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 		await mkdir(agentDir, { recursive: true });
 
 		const { modelRuntime, model, pendingSteps } = await prepareModel(scenario, options, hostAgentDir);
+		restoreRunEnvironment = restrictEnvironment();
 		if (scenario.bus) bus = await startScenarioBus(scenario.bus.tools);
 		const settingsManager = SettingsManager.inMemory({
 			retry: { enabled: false },
@@ -218,7 +265,7 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 			extensionFactories: scenarioExtensions(scenario, bus),
 		});
 		await resourceLoader.reload();
-		const { session } = await createAgentSession({
+		({ session } = await createAgentSession({
 			cwd: workspace,
 			agentDir,
 			model,
@@ -228,7 +275,7 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 			settingsManager,
 			thinkingLevel: "off",
 			tools: scenario.tools,
-		});
+		}));
 		const unsubscribe = session.subscribe((event) => {
 			if (event.type === "tool_execution_end") toolExecutions.push({ name: event.toolName, isError: event.isError });
 			if (event.type === "turn_end") turns++;
@@ -266,7 +313,6 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 			busCalls: bus?.calls ?? [],
 		});
 		const stats = session.getSessionStats();
-		session.dispose();
 		return {
 			id: scenario.id,
 			mode: options.model ? "model" : "faux",
@@ -283,14 +329,14 @@ export async function runScenario(scenario: LoadedScenario, options: RunScenario
 				inputTokens: stats.tokens.input,
 				outputTokens: stats.tokens.output,
 				totalTokens: stats.tokens.total,
-				costUsd: options.model && isPriced(model) ? stats.cost : null,
+				costUsd: options.model && hasPricing(model) ? stats.cost : null,
 				durationMs: Math.round(durationMs),
 			},
 		};
 	} finally {
+		session?.dispose();
 		await bus?.close();
-		if (previousPermissionMode === undefined) delete process.env.OCTOBER_PERMISSION_MODE;
-		else process.env.OCTOBER_PERMISSION_MODE = previousPermissionMode;
+		restoreRunEnvironment?.();
 		restoreEnvironment();
 		await rm(root, { recursive: true, force: true });
 	}

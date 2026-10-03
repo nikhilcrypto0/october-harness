@@ -223,6 +223,56 @@ describe("scenario evals", () => {
 		expect(replay).toMatchObject({ passed: true, errors: [] });
 	});
 
+	it("hides host credentials from tools and restores them afterwards", async () => {
+		const previous = process.env.ANTHROPIC_API_KEY;
+		process.env.ANTHROPIC_API_KEY = "sk-scenario-test-secret";
+		try {
+			write("s/scenario.json", {
+				formatVersion: 1,
+				id: "test/no-credentials",
+				prompt: "Print the key.",
+				tools: ["bash"],
+				faux: [
+					{ toolCall: { name: "bash", args: { command: 'echo "key=$ANTHROPIC_API_KEY" > env.txt' } } },
+					{ text: "Done." },
+				],
+				expect: [{ file: "env.txt", contains: "key=", notContains: "sk-scenario-test-secret" }],
+			});
+
+			const result = await runScenario(await loadScenario(join(tempDir, "s")));
+
+			expect(result).toMatchObject({ passed: true, errors: [] });
+			expect(process.env.ANTHROPIC_API_KEY).toBe("sk-scenario-test-secret");
+		} finally {
+			if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
+			else process.env.ANTHROPIC_API_KEY = previous;
+		}
+	});
+
+	it("skips dependencies and hidden directories when discovering scenarios", async () => {
+		write("pack/real/scenario.json", renameScenario);
+		write("pack/node_modules/dep/scenario.json", renameScenario);
+		write("pack/.eval/old/scenario.json", renameScenario);
+
+		expect(await discoverScenarios(join(tempDir, "pack"))).toEqual([join(tempDir, "pack/real")]);
+	});
+
+	it("checks files whose names start with two dots but rejects escapes", async () => {
+		write("s/scenario.json", {
+			...renameScenario,
+			expect: [{ file: "..notes", contains: "kept" }],
+		});
+		write("s/workspace/a.txt", "old\n");
+		write("s/workspace/..notes", "kept\n");
+		const passing = await runScenario(await loadScenario(join(tempDir, "s")));
+		expect(passing.checks[0]).toMatchObject({ passed: true });
+
+		write("s/scenario.json", { ...renameScenario, expect: [{ file: "../escape.txt", exists: true }] });
+		await expect(runScenario(await loadScenario(join(tempDir, "s")))).rejects.toThrow(
+			"Check path escapes the workspace",
+		);
+	});
+
 	it("rejects an invalid scenario with every problem path", async () => {
 		write("s/scenario.json", { ...renameScenario, formatVersion: 2, sandbox: true, expect: [] });
 

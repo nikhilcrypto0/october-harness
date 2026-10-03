@@ -1,7 +1,7 @@
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ScenarioCheck } from "./scenario.ts";
 
 const COMMAND_TIMEOUT_MS = 60_000;
@@ -29,7 +29,7 @@ export type CheckResult = { check: string; passed: boolean; weight: number; deta
 function workspacePath(workspace: string, file: string): string {
 	const path = resolve(workspace, file);
 	const fromWorkspace = relative(workspace, path);
-	if (fromWorkspace.startsWith("..") || isAbsolute(fromWorkspace)) {
+	if (fromWorkspace === ".." || fromWorkspace.startsWith(`..${sep}`) || isAbsolute(fromWorkspace)) {
 		throw new Error(`Check path escapes the workspace: ${file}`);
 	}
 	return path;
