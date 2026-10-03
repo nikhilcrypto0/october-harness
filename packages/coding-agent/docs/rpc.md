@@ -167,6 +167,8 @@ The detailed references formerly on this page now have dedicated pages. These an
 <a id="abort_bash"></a>
 <a id="get_session_stats"></a>
 <a id="export_html"></a>
+<a id="export_jsonl"></a>
+<a id="import_jsonl"></a>
 <a id="switch_session"></a>
 <a id="fork"></a>
 <a id="clone"></a>

@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.87.1-october.3] - 2026-09-30
+
+### Added
+
+- Added a built-in MCP client that connects to servers configured in the `mcpServers` setting ([#22](https://github.com/october-dev/october-harness/pull/22)).
+- Added portable session export and import across the CLI, RPC, and SDK. The portable JSONL format omits credentials, provider replay state, and source-machine paths, and import validates the whole file before writing ([#31](https://github.com/october-dev/october-harness/pull/31)).
+- Added extension capability manifests (`pi.capabilities` in `package.json` or an `<entry>.capabilities.json` sidecar). They are validated before an extension's code loads; an invalid manifest is a load error. They describe expected access and are not a sandbox ([#28](https://github.com/october-dev/october-harness/pull/28)).
+
+### Changed
+
+- Desktop-launched runs refresh the October session only through the October Bus. If the Bus cannot supply a token, the turn fails with an `october_session_unavailable` error instead of refreshing against Supabase directly, and a still-valid token keeps working until it expires. Desktop no longer needs to pass a Supabase refresh token. Standalone sign-in is unchanged.
+- `--mode json` emits startup warnings and errors, such as an unknown model id or a new `--session-id`, as `{"type":"diagnostic"}` records on stdout instead of stderr text, so a warning is never read as a turn's failure reason.
+- `--list-models` limits each model availability check to 5 seconds and lists the last known models when a check times out.
+
+### Fixed
+
+- Fixed one-shot `--provider october` runs warning that a gateway-served model was not found. Model ids are now matched exactly, never to a similar id. When the requested id is missing, the October catalogue is fetched once (5 second limit); if the live catalogue does not offer the id, the run fails with a `model_not_found` error naming it, and if the catalogue cannot be fetched, the id is sent as given with a `model_unverified` warning.
+
 ## [0.87.1-october.2] - 2026-09-25
 
 ### Added
@@ -22,6 +40,9 @@
 ### Fixed
 
 - Prevented managed git packages from automatically installing Pi peer dependencies and added warnings for extension packages that list host-provided modules in `dependencies` ([#9863](https://github.com/earendil-works/pi/issues/9863)).
+- Fixed the Fireworks default model pointing at the removed Kimi K2.6 model; it now defaults to Kimi K3.
+- Fixed the Together default model pointing at the removed Kimi K2.6 model; it now defaults to Kimi K3.
+- Fixed the OpenCode Go default model pointing at the removed Kimi K2.6 model; it now defaults to Kimi K3.
 
 ## [0.87.1] - 2026-09-22
 

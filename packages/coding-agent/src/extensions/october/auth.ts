@@ -21,8 +21,28 @@ interface SupabaseSessionEnv {
 	url: string;
 	anonKey: string;
 	accessToken: string;
+	/** Empty in Desktop mode when Desktop keeps the refresh token to itself. */
 	refreshToken: string;
 	expiresAt?: number;
+}
+
+/** Stable token in the message so Desktop's error classifier can match it. */
+export const OCTOBER_SESSION_UNAVAILABLE_CODE = "october_session_unavailable";
+
+/**
+ * Desktop owns the Supabase session and the Bus could not supply a fresh access token. The
+ * harness never refreshes against Supabase itself in this state; October must re-issue the token.
+ */
+export class OctoberSessionUnavailableError extends Error {
+	readonly code = OCTOBER_SESSION_UNAVAILABLE_CODE;
+
+	constructor(reason: string, options?: ErrorOptions) {
+		super(
+			`October session unavailable (${OCTOBER_SESSION_UNAVAILABLE_CODE}): ${reason}. Ask October to refresh your sign-in, then retry.`,
+			options,
+		);
+		this.name = "OctoberSessionUnavailableError";
+	}
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -33,13 +53,14 @@ function nonEmpty(value: string | undefined): string | undefined {
 /**
  * The Supabase session October-desktop injects for the signed-in user, mirroring how it already
  * injects OCTOBER_BUS_*. Absent outside the October app, which keeps the provider inert there.
+ * Desktop refreshes through the Bus, so its refresh token is optional in Desktop mode.
  */
 function readSupabaseSessionEnv(env: NodeJS.ProcessEnv = process.env): SupabaseSessionEnv | undefined {
 	const url = nonEmpty(env.OCTOBER_SUPABASE_URL);
 	const anonKey = nonEmpty(env.OCTOBER_SUPABASE_ANON_KEY);
 	const accessToken = nonEmpty(env.OCTOBER_SUPABASE_ACCESS_TOKEN);
-	const refreshToken = nonEmpty(env.OCTOBER_SUPABASE_REFRESH_TOKEN);
-	if (!url || !anonKey || !accessToken || !refreshToken) return undefined;
+	const refreshToken = nonEmpty(env.OCTOBER_SUPABASE_REFRESH_TOKEN) ?? (isOctoberDesktopMode(env) ? "" : undefined);
+	if (!url || !anonKey || !accessToken || refreshToken === undefined) return undefined;
 
 	const expiresRaw = nonEmpty(env.OCTOBER_SUPABASE_EXPIRES_AT);
 	const expiresAt = expiresRaw !== undefined ? Number(expiresRaw) : undefined;
@@ -127,8 +148,6 @@ let desktopOwnedToken: string | undefined;
 let previousInferenceToken: string | undefined;
 let desktopRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 let desktopRefreshInFlight: Promise<void> | undefined;
-/** Process-global: once Desktop has rotated the session via the bus, the spawn-time refresh token is dead. */
-let busRefreshEverSucceeded = false;
 
 export function getDesktopOctoberCredential(): OAuthCredentials | undefined {
 	return desktopCredential;
@@ -151,7 +170,6 @@ export function resetDesktopOctoberState(): void {
 	stopDesktopOctoberRefresh();
 	desktopRefreshInFlight = undefined;
 	clearDesktopCredential();
-	busRefreshEverSucceeded = false;
 }
 
 function applyDesktopCredential(next: OAuthCredentials, userId?: string): OAuthCredentials {
@@ -180,18 +198,18 @@ async function refreshViaBus(credentials: OAuthCredentials, signal: AbortSignal)
 	const port = nonEmpty(process.env.OCTOBER_BUS_PORT);
 	const busToken = nonEmpty(process.env.OCTOBER_BUS_TOKEN);
 	if (!port || !busToken) {
-		throw new Error("October bus token refresh is not available.");
+		throw new OctoberSessionUnavailableError("the October Bus token route is not configured");
 	}
 	const response = await fetch(`http://127.0.0.1:${port}/auth/october-token`, {
 		headers: { Accept: "application/json", Authorization: `Bearer ${busToken}` },
 		signal,
 	});
 	if (!response.ok) {
-		throw new Error(`October bus token refresh failed: HTTP ${response.status}`);
+		throw new OctoberSessionUnavailableError(`the October Bus token route answered HTTP ${response.status}`);
 	}
 	const body = (await response.json()) as { access_token?: unknown; expires_at?: unknown };
 	if (typeof body.access_token !== "string" || !body.access_token) {
-		throw new Error("October bus token refresh returned no access_token.");
+		throw new OctoberSessionUnavailableError("the October Bus token route returned no access token");
 	}
 	const expiresAt =
 		typeof body.expires_at === "number"
@@ -210,7 +228,6 @@ async function refreshViaBus(credentials: OAuthCredentials, signal: AbortSignal)
 	if (isOctoberDesktopMode()) {
 		applyDesktopCredential(next, desktopUserId);
 	}
-	busRefreshEverSucceeded = true;
 	return next;
 }
 
@@ -256,30 +273,26 @@ async function refreshViaSupabase(credentials: OAuthCredentials, signal: AbortSi
 	return next;
 }
 
+/**
+ * Desktop owns the Supabase session, so under Desktop the Bus is the only refresher. A direct
+ * Supabase refresh from here would rotate the token behind Desktop's back and trip Supabase's
+ * reuse detection, signing the user out everywhere. Outside Desktop, the stored session refreshes
+ * against Supabase as before.
+ */
 async function refreshOctoberSession(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials> {
-	if (busRefreshConfigured()) {
-		try {
-			return await refreshViaBus(credentials, signal);
-		} catch (error) {
-			if (busRefreshEverSucceeded) {
-				// Desktop has rotated the session; our spawn-time refresh token is dead.
-				// A Supabase fallback here trips reuse-detection → sign-out everywhere.
-				// Keep the current token; the next turn/timer retries the bus.
-				throw error;
-			}
-			// Part C may not be live yet: Desktop already injects the bus, but
-			// /auth/october-token can 404 or refuse. Fall back to Supabase.
-			logOctoberDebug(
-				`october bus token refresh failed, falling back to Supabase (bus never succeeded yet): ${error instanceof Error ? error.message : String(error)}`,
-			);
-			return refreshViaSupabase(credentials, signal);
-		}
+	if (!isOctoberDesktopMode()) {
+		return refreshViaSupabase(credentials, signal);
 	}
-	if (busRefreshEverSucceeded) {
-		// Bus env vanished after a successful rotation — same dead-token hazard as a 503.
-		throw new Error("October bus token refresh is not available.");
+	if (!busRefreshConfigured()) {
+		throw new OctoberSessionUnavailableError("the October Bus token route is not configured");
 	}
-	return refreshViaSupabase(credentials, signal);
+	try {
+		return await refreshViaBus(credentials, signal);
+	} catch (error) {
+		if (error instanceof OctoberSessionUnavailableError) throw error;
+		const reason = signal.aborted ? "the October Bus did not answer in time" : "the October Bus token route failed";
+		throw new OctoberSessionUnavailableError(reason, { cause: error });
+	}
 }
 
 function scheduleDesktopOctoberRefresh(): void {
@@ -323,9 +336,24 @@ export async function ensureDesktopOctoberAccess(signal?: AbortSignal): Promise<
 	}
 	desktopRefreshInFlight = (async () => {
 		const current = desktopCredential ?? credentialFromEnv(session);
-		const next = await refreshOctoberSession(current, signal ?? AbortSignal.timeout(DESKTOP_REFRESH_TIMEOUT_MS));
-		applyDesktopCredential(next, desktopUserId);
-		scheduleDesktopOctoberRefresh();
+		// One Bus request per attempt, capped by the timeout; the timer retries later.
+		const timeout = AbortSignal.timeout(DESKTOP_REFRESH_TIMEOUT_MS);
+		try {
+			const next = await refreshOctoberSession(current, signal ? AbortSignal.any([signal, timeout]) : timeout);
+			applyDesktopCredential(next, desktopUserId);
+			scheduleDesktopOctoberRefresh();
+		} catch (error) {
+			// Refresh starts inside the expiry margin, so the current token may still be valid.
+			// Keep using it and retry on the timer; fail only once it has actually expired.
+			if (!signal?.aborted && current.expires > Date.now()) {
+				logOctoberDebug(
+					`desktop october refresh failed, keeping the unexpired token: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				scheduleDesktopOctoberRefresh();
+				return;
+			}
+			throw error;
+		}
 	})();
 	try {
 		await desktopRefreshInFlight;

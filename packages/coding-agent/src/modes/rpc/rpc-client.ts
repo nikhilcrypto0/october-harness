@@ -11,6 +11,7 @@ import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
+import type { PortableSessionDiagnostic } from "../../core/session-portable.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
@@ -368,6 +369,24 @@ export class RpcClient {
 	 */
 	async exportHtml(outputPath?: string): Promise<{ path: string }> {
 		const response = await this.send({ type: "export_html", outputPath });
+		return this.getData(response);
+	}
+
+	/**
+	 * Export the current branch as a portable session JSONL file.
+	 * @returns Output path and every excluded or changed value
+	 */
+	async exportJsonl(outputPath?: string): Promise<{ path: string; diagnostics: PortableSessionDiagnostic[] }> {
+		const response = await this.send({ type: "export_jsonl", outputPath });
+		return this.getData(response);
+	}
+
+	/**
+	 * Import a portable session JSONL file as a new session and switch to it.
+	 * @returns Object with `cancelled: true` if an extension cancelled the switch
+	 */
+	async importJsonl(inputPath: string): Promise<{ cancelled: boolean }> {
+		const response = await this.send({ type: "import_jsonl", inputPath });
 		return this.getData(response);
 	}
 

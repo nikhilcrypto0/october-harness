@@ -13,6 +13,13 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { SessionManager } from "./session-manager.ts";
+import {
+	commitPortableImport,
+	isPortableSessionFile,
+	preparePortableImport,
+	SessionImportError,
+	SessionImportFileNotFoundError,
+} from "./session-portable.ts";
 
 /**
  * Result returned by runtime creation.
@@ -39,19 +46,6 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	sessionStartEvent?: SessionStartEvent;
 	projectTrustContext?: ProjectTrustContext;
 }) => Promise<CreateAgentSessionRuntimeResult>;
-
-/**
- * Thrown when /import references a JSONL file path that does not exist.
- */
-export class SessionImportFileNotFoundError extends Error {
-	readonly filePath: string;
-
-	constructor(filePath: string) {
-		super(`File not found: ${filePath}`);
-		this.name = "SessionImportFileNotFoundError";
-		this.filePath = filePath;
-	}
-}
 
 function extractUserMessageText(content: string | Array<{ type: string; text?: string }>): string {
 	if (typeof content === "string") {
@@ -352,7 +346,47 @@ export class AgentSessionRuntime {
 	}
 
 	/**
+	 * Import a portable session file as a new native session for this runtime's cwd and switch to it.
+	 * Only files with the portable header marker are accepted.
+	 *
+	 * @returns `{ cancelled: true }` when cancelled by `session_before_switch`, otherwise `{ cancelled: false }`.
+	 * @throws {SessionImportError} When session persistence is disabled.
+	 * @throws {SessionImportFileNotFoundError} When the input path does not exist.
+	 * @throws {PortableSessionError} When the file does not match the portable session contract.
+	 * @throws {SessionImportIdConflictError} When the session id already exists in the session directory.
+	 */
+	async importPortable(inputPath: string): Promise<{ cancelled: boolean }> {
+		const currentSessionManager = this.session.sessionManager;
+		if (!currentSessionManager.isPersisted()) {
+			throw new SessionImportError("Cannot import a session while session persistence is disabled");
+		}
+		const sessionDir = currentSessionManager.getSessionDir();
+		const prepared = preparePortableImport(inputPath, { cwd: this.cwd, sessionDir });
+		const beforeResult = await this.emitBeforeSwitch("resume", prepared.destination);
+		if (beforeResult.cancelled) {
+			return beforeResult;
+		}
+
+		const previousSessionFile = this.session.sessionFile;
+		commitPortableImport(prepared);
+		const sessionManager = SessionManager.open(prepared.destination, sessionDir);
+		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		this.apply(
+			await this.createRuntime({
+				cwd: this.cwd,
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+			}),
+		);
+		await this.finishSessionReplacement();
+		return { cancelled: false };
+	}
+
+	/**
 	 * Import a session JSONL file and switch runtime state to the imported session.
+	 * Portable session files are delegated to importPortable(). Other files are copied into the
+	 * session directory unchanged and opened with their header cwd.
 	 *
 	 * @returns `{ cancelled: true }` when cancelled by `session_before_switch`, otherwise `{ cancelled: false }`.
 	 * @throws {SessionImportFileNotFoundError} When the input path does not exist.
@@ -362,6 +396,9 @@ export class AgentSessionRuntime {
 		const resolvedPath = resolvePath(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
+		}
+		if (isPortableSessionFile(resolvedPath)) {
+			return this.importPortable(resolvedPath);
 		}
 
 		const sessionDir = this.session.sessionManager.getSessionDir();

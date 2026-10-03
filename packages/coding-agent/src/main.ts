@@ -5,11 +5,13 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
+import { type Args, isValidThinkingLevel, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
 import {
 	type AuthCheckResult,
 	checkProviderAuth,
@@ -46,9 +48,9 @@ import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
+import { resolveCliModel, resolveModelScopeWithDiagnostics, type ScopedModel } from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
-import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
+import { flushRawStdout, restoreStdout, takeOverStdout, writeRawStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
 import type { CreateAgentSessionOptions } from "./core/sdk.ts";
 import {
@@ -57,13 +59,20 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import { assertValidSessionId, getDefaultSessionDirPath, SessionManager } from "./core/session-manager.ts";
+import {
+	exportPortableSession,
+	formatPortableSessionDiagnostics,
+	importPortableSession,
+} from "./core/session-portable.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
-import { builtInExtensions } from "./extensions/index.ts";
+import { createBuiltInExtensions } from "./extensions/index.ts";
+import { OCTOBER_PROVIDER_ID } from "./extensions/october/auth.ts";
 import { seedOctoberDefaultPackages } from "./extensions/october/default-packages.ts";
+import { octoberCatalogIsLive } from "./extensions/october/provider.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
@@ -71,6 +80,9 @@ import { validateThemeJson } from "./modes/interactive/theme/theme-json.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
+
+/** `--list-models` is a metadata command: each availability pass (auth checks, token refresh) gets 5 s. */
+const LIST_MODELS_AVAILABILITY_TIMEOUT_MS = 5_000;
 
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
 
@@ -97,7 +109,27 @@ async function readPipedStdin(): Promise<string | undefined> {
 	});
 }
 
-function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
+/**
+ * In `--mode json`, stderr text from a failed run is easily mistaken for its failure reason, so
+ * startup diagnostics go to stdout as NDJSON records instead. The record deliberately has no
+ * `stopReason`: a warning must never read as a failed turn.
+ */
+function reportDiagnostics(
+	diagnostics: readonly AgentSessionRuntimeDiagnostic[],
+	outputMode: "json" | "text" = "text",
+): void {
+	if (outputMode === "json") {
+		for (const diagnostic of diagnostics) {
+			const record = {
+				type: "diagnostic",
+				level: diagnostic.type,
+				...(diagnostic.code ? { code: diagnostic.code } : {}),
+				message: diagnostic.message,
+			};
+			writeRawStdout(`${JSON.stringify(record)}\n`);
+		}
+		return;
+	}
 	for (const diagnostic of diagnostics) {
 		const color = diagnostic.type === "error" ? chalk.red : diagnostic.type === "warning" ? chalk.yellow : chalk.dim;
 		const prefix = diagnostic.type === "error" ? "Error: " : diagnostic.type === "warning" ? "Warning: " : "";
@@ -313,6 +345,32 @@ function validateForkFlags(parsed: Args): void {
 	}
 }
 
+/**
+ * Report --import conflicts. Returns false when main() should stop.
+ *
+ * The portable import and export paths end main() with process.exitCode instead of process.exit(),
+ * because a hard exit can drop pending writes when stdout/stderr are non-blocking pipes.
+ */
+function validateImportFlags(parsed: Args): boolean {
+	if (parsed.import === undefined) return true;
+
+	const conflictingFlags = [
+		parsed.session ? "--session" : undefined,
+		parsed.sessionId ? "--session-id" : undefined,
+		parsed.continue ? "--continue" : undefined,
+		parsed.resume ? "--resume" : undefined,
+		parsed.fork ? "--fork" : undefined,
+		parsed.noSession ? "--no-session" : undefined,
+		parsed.export ? "--export" : undefined,
+	].filter((flag): flag is string => flag !== undefined);
+
+	if (conflictingFlags.length > 0) {
+		console.error(chalk.red(`Error: --import cannot be combined with ${conflictingFlags.join(", ")}`));
+		return false;
+	}
+	return true;
+}
+
 function validateResumeIdFlags(parsed: Args): void {
 	if (parsed.resumeId === undefined) return;
 
@@ -379,6 +437,16 @@ export async function createSessionManager(
 ): Promise<SessionManager> {
 	if (parsed.noSession || parsed.help || parsed.listModels !== undefined) {
 		return SessionManager.inMemory(cwd, parsed.sessionId !== undefined ? { id: parsed.sessionId } : undefined);
+	}
+
+	if (parsed.import) {
+		// A path only: commitPortableImport() creates the directory after validation succeeds.
+		// Errors propagate to main(), which reports them and ends with process.exitCode.
+		const importedPath = importPortableSession(parsed.import, {
+			cwd,
+			sessionDir: sessionDir ?? getDefaultSessionDirPath(cwd),
+		});
+		return SessionManager.open(importedPath, sessionDir);
 	}
 
 	if (parsed.fork) {
@@ -478,14 +546,82 @@ export async function createSessionManager(
 		if (existingSession) {
 			return SessionManager.open(existingSession.path, sessionDir);
 		}
-		console.error(
-			chalk.yellow(
-				`Warning: No project session found with id '${parsed.sessionId}'; creating a new session with that id.`,
-			),
+		reportDiagnostics(
+			[
+				{
+					type: "warning",
+					code: "session_created",
+					message: `No project session found with id '${parsed.sessionId}'; creating a new session with that id.`,
+				},
+			],
+			parsed.mode === "json" ? "json" : "text",
 		);
 	}
 
 	return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
+}
+
+/** Bounds the one October catalogue fetch a one-shot run may make before resolving its model. */
+const OCTOBER_CLI_CATALOG_TIMEOUT_MS = 5_000;
+
+interface OctoberCliModel {
+	model?: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
+	diagnostic?: AgentSessionRuntimeDiagnostic;
+}
+
+/**
+ * Desktop runs `--provider october --model <gateway id>`. Gateway ids are exact, so this resolves
+ * them verbatim instead of through the fuzzy resolver, which could pick a different model
+ * (`openrouter/deepseek/deepseek-v4` partially matches `openrouter/deepseek/deepseek-v4.1-flash`).
+ * The catalogue starts as the seed list; a missing id triggers one bounded fetch of the live
+ * catalogue. An id the live catalogue does not offer is a `model_not_found` error. If the fetch
+ * fails, the id is sent as given and the gateway decides. Returns undefined for other providers.
+ */
+async function resolveOctoberCliModel(parsed: Args, modelRuntime: ModelRuntime): Promise<OctoberCliModel | undefined> {
+	if (!parsed.model || parsed.provider?.toLowerCase() !== OCTOBER_PROVIDER_ID) return undefined;
+	let id = parsed.model;
+	let thinkingLevel: ThinkingLevel | undefined;
+	const lastColon = id.lastIndexOf(":");
+	const suffix = id.slice(lastColon + 1);
+	if (!parsed.thinking && lastColon !== -1 && isValidThinkingLevel(suffix)) {
+		id = id.slice(0, lastColon);
+		thinkingLevel = suffix;
+	}
+
+	let model = modelRuntime.getModel(OCTOBER_PROVIDER_ID, id);
+	if (!model) {
+		try {
+			await modelRuntime.refresh({
+				providers: [OCTOBER_PROVIDER_ID],
+				signal: AbortSignal.timeout(OCTOBER_CLI_CATALOG_TIMEOUT_MS),
+			});
+		} catch {
+			// Unreachable catalogue: handled below as an unverified id.
+		}
+		model = modelRuntime.getModel(OCTOBER_PROVIDER_ID, id);
+	}
+	if (model) return { model, thinkingLevel };
+	if (octoberCatalogIsLive()) {
+		return {
+			diagnostic: {
+				type: "error",
+				code: "model_not_found",
+				message: `Model "${id}" is not offered by October (model_not_found). Use --list-models to see available models.`,
+			},
+		};
+	}
+	const [base] = modelRuntime.getModels(OCTOBER_PROVIDER_ID);
+	if (!base) return undefined;
+	return {
+		model: { ...base, id, name: id },
+		thinkingLevel,
+		diagnostic: {
+			type: "warning",
+			code: "model_unverified",
+			message: `Could not load the October model catalogue; using "${id}" as given.`,
+		},
+	};
 }
 
 function buildSessionOptions(
@@ -494,6 +630,7 @@ function buildSessionOptions(
 	hasExistingSession: boolean,
 	modelRuntime: ModelRuntime,
 	settingsManager: SettingsManager,
+	octoberModel?: OctoberCliModel,
 ): {
 	options: CreateAgentSessionOptions;
 	cliThinkingFromModel: boolean;
@@ -506,7 +643,14 @@ function buildSessionOptions(
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
 	// - supports --model <provider>/<pattern>
-	if (parsed.model) {
+	if (octoberModel) {
+		if (octoberModel.diagnostic) diagnostics.push(octoberModel.diagnostic);
+		options.model = octoberModel.model;
+		if (!parsed.thinking && octoberModel.thinkingLevel) {
+			options.thinkingLevel = octoberModel.thinkingLevel;
+			cliThinkingFromModel = true;
+		}
+	} else if (parsed.model) {
 		const resolved = resolveCliModel({
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
@@ -606,7 +750,6 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
-	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
@@ -629,10 +772,14 @@ export async function main(args: string[], options?: MainOptions) {
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
 	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+	const bootstrapExtensionFactories = [
+		...createBuiltInExtensions(bootstrapSettingsManager),
+		...(options?.extensionFactories ?? []),
+	];
 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher();
 
-	if (await handlePackageCommand(args, { extensionFactories })) {
+	if (await handlePackageCommand(args, { extensionFactories: bootstrapExtensionFactories })) {
 		const exitCode = process.exitCode ?? 0;
 		if (process.platform === "win32" && exitCode === 0 && args[0] === "update") {
 			// We normally prefer process.exit(0) for package commands so bad extensions cannot keep
@@ -645,17 +792,15 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	if (await handleConfigCommand(args, { extensionFactories })) {
+	if (await handleConfigCommand(args, { extensionFactories: bootstrapExtensionFactories })) {
 		return;
 	}
 
 	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
-		for (const d of parsed.diagnostics) {
-			const color = d.type === "error" ? chalk.red : chalk.yellow;
-			console.error(color(`${d.type === "error" ? "Error" : "Warning"}: ${d.message}`));
-		}
+		reportDiagnostics(parsed.diagnostics, parsed.mode === "json" ? "json" : "text");
 		if (parsed.diagnostics.some((d) => d.type === "error")) {
+			await flushRawStdout();
 			process.exit(1);
 		}
 	}
@@ -666,18 +811,37 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
+	// --export exits before the other session flag checks, so check its --import conflict first.
+	if (!validateImportFlags(parsed)) {
+		process.exitCode = 1;
+		return;
+	}
+
 	if (parsed.export) {
 		let result: string;
 		try {
 			const outputPath = parsed.messages.length > 0 ? parsed.messages[0] : undefined;
-			result = await exportFromFile(parsed.export, outputPath);
+			if (outputPath?.endsWith(".jsonl")) {
+				const inputPath = resolvePath(parsed.export);
+				if (!existsSync(inputPath)) {
+					throw new Error(`File not found: ${inputPath}`);
+				}
+				const exported = exportPortableSession(SessionManager.open(inputPath), outputPath);
+				for (const line of formatPortableSessionDiagnostics(exported.diagnostics)) {
+					console.error(chalk.dim(line));
+				}
+				result = exported.path;
+			} else {
+				result = await exportFromFile(parsed.export, outputPath);
+			}
 		} catch (error: unknown) {
 			const message = error instanceof Error ? error.message : "Failed to export session";
 			console.error(chalk.red(`Error: ${message}`));
-			process.exit(1);
+			process.exitCode = 1;
+			return;
 		}
 		console.log(`Exported to: ${result}`);
-		process.exit(0);
+		return;
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
@@ -734,7 +898,16 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	let sessionManager: SessionManager;
+	try {
+		sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	} catch (error: unknown) {
+		// Only --import failures are reported here; other errors keep their existing handling.
+		if (!parsed.import) throw error;
+		console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
+		process.exitCode = 1;
+		return;
+	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -790,11 +963,17 @@ export async function main(args: string[], options?: MainOptions) {
 				parsed.projectTrustOverride ??
 				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
 		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+		const extensionFactories = [
+			...createBuiltInExtensions(runtimeSettingsManager),
+			...(options?.extensionFactories ?? []),
+		];
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
 			settingsManager: runtimeSettingsManager,
-			modelRuntimeSignal: AbortSignal.timeout(15_000),
+			modelRuntimeSignal: AbortSignal.timeout(
+				parsed.listModels !== undefined ? LIST_MODELS_AVAILABILITY_TIMEOUT_MS : 15_000,
+			),
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
 				? {
@@ -851,10 +1030,16 @@ export async function main(args: string[], options?: MainOptions) {
 		];
 
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
-		const scopedModels =
-			modelPatterns && modelPatterns.length > 0
-				? await resolveModelScope(modelPatterns, modelRuntime, { signal: AbortSignal.timeout(15_000) })
-				: [];
+		let scopedModels: ScopedModel[] = [];
+		if (modelPatterns && modelPatterns.length > 0) {
+			const scope = await resolveModelScopeWithDiagnostics(modelPatterns, modelRuntime, {
+				signal: AbortSignal.timeout(15_000),
+			});
+			scopedModels = scope.scopedModels;
+			diagnostics.push(...scope.diagnostics);
+		}
+		const octoberModel =
+			!offlineMode && appMode !== "interactive" ? await resolveOctoberCliModel(parsed, modelRuntime) : undefined;
 		const {
 			options: sessionOptions,
 			cliThinkingFromModel,
@@ -865,6 +1050,7 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionManager.buildSessionContext().messages.length > 0,
 			modelRuntime,
 			settingsManager,
+			octoberModel,
 		);
 		diagnostics.push(...sessionOptionDiagnostics);
 
@@ -927,7 +1113,7 @@ export async function main(args: string[], options?: MainOptions) {
 	if (parsed.listModels !== undefined) {
 		reportDiagnostics(startupSettingsDiagnostics);
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
-		await listModels(modelRuntime, searchPattern, AbortSignal.timeout(15_000));
+		await listModels(modelRuntime, searchPattern, AbortSignal.timeout(LIST_MODELS_AVAILABILITY_TIMEOUT_MS));
 		process.exit(0);
 	}
 
@@ -957,12 +1143,13 @@ export async function main(args: string[], options?: MainOptions) {
 	const startupDiagnostics = deduplicateDiagnostics([...startupSettingsDiagnostics, ...runtime.diagnostics]);
 	const hasRuntimeErrors = runtime.diagnostics.some((diagnostic) => diagnostic.type === "error");
 	if (appMode !== "interactive" || hasRuntimeErrors) {
-		reportDiagnostics(startupDiagnostics);
+		reportDiagnostics(startupDiagnostics, appMode === "json" ? "json" : "text");
 	}
 	if (hasRuntimeErrors) {
 		if (runtime.diagnostics.some((diagnostic) => diagnostic.message.includes("Failed to load extension"))) {
 			console.error(chalk.yellow(EXTENSION_LOAD_FAILURE_HINT));
 		}
+		await flushRawStdout();
 		process.exit(1);
 	}
 	time("createAgentSession");

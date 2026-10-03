@@ -1,0 +1,52 @@
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { listModels } from "../src/cli/list-models.ts";
+import type { ModelRuntime } from "../src/core/model-runtime.ts";
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
+
+const known = {
+	provider: "october",
+	id: "october/Qwen/Qwen3.6-35B-A3B-FP8",
+	contextWindow: 128000,
+	maxTokens: 32000,
+	reasoning: true,
+	input: ["text"],
+} as unknown as Model<Api>;
+
+describe("listModels availability timeout", () => {
+	it("lists the last known models when the availability check exceeds its deadline", async () => {
+		const runtime = {
+			getError: () => undefined,
+			// Stands in for an auth check that never answers: settles only when the caller aborts.
+			getAvailable: (_provider: string | undefined, options?: { signal?: AbortSignal }) =>
+				new Promise<never>((_resolve, reject) => {
+					options?.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+				}),
+			getAvailableSnapshot: () => [known],
+		} as unknown as ModelRuntime;
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const started = Date.now();
+		await listModels(runtime, undefined, AbortSignal.timeout(50));
+
+		expect(Date.now() - started).toBeLessThan(5_000);
+		expect(error.mock.calls.flat().join("\n")).toContain("timed out");
+		expect(log.mock.calls.flat().join("\n")).toContain("october/Qwen/Qwen3.6-35B-A3B-FP8");
+	});
+
+	it("still surfaces a non-timeout availability failure", async () => {
+		const runtime = {
+			getError: () => undefined,
+			getAvailable: async () => {
+				throw new Error("broken auth store");
+			},
+			getAvailableSnapshot: () => [known],
+		} as unknown as ModelRuntime;
+
+		await expect(listModels(runtime, undefined, AbortSignal.timeout(5_000))).rejects.toThrow("broken auth store");
+	});
+});

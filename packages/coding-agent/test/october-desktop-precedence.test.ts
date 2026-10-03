@@ -141,6 +141,7 @@ describe("Desktop credential ownership through the composed model runtime", () =
 		const before = requests.length;
 		const failed = await runtime.completeSimple(model, { messages });
 		expect(failed.stopReason).toBe("error");
+		expect(failed.errorMessage).toMatch(/october_session_unavailable/);
 		expect(requests).toHaveLength(before);
 		expect(write).not.toHaveBeenCalled();
 		expect(await storage.read("october")).toEqual({ type: "api_key", key: savedToken });

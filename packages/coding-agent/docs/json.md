@@ -16,11 +16,22 @@ The stream uses strict JSONL framing. Each record is one JSON object terminated 
 
 Node.js `readline` is not suitable for this stream because it also recognizes those Unicode separators. Use a byte or UTF-8 stream decoder and split on LF.
 
-Read stdout continuously. A reader that stops consuming records can stall Pi when the pipe buffer fills. Stdout is reserved for JSONL; diagnostics and application logging go to stderr.
+Read stdout continuously. A reader that stops consuming records can stall Pi when the pipe buffer fills. Stdout is reserved for JSONL. Startup diagnostics are JSONL records on stdout (see below); other application logging goes to stderr.
+
+## Startup diagnostics
+
+Warnings and errors found while starting, such as an unknown or unverified model id or a new `--session-id`, are emitted as `diagnostic` records before the session header. They carry no `stopReason`, so a warning never reads as a failed turn. `code` is present when the diagnostic has a stable identifier.
+
+```json
+{"type":"diagnostic","level":"warning","code":"session_created","message":"No project session found with id '...'; creating a new session with that id."}
+{"type":"diagnostic","level":"error","code":"model_not_found","message":"Model \"openrouter/example\" is not offered by October (model_not_found). Use --list-models to see available models."}
+```
+
+`level` is `info`, `warning`, or `error`. A startup error ends the process with exit code 1 and no session events.
 
 ## Session header
 
-The first JSON-mode record is the current [session header](session-format.md#sessionheader):
+The first session record is the current [session header](session-format.md#sessionheader):
 
 ```json
 {"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path"}

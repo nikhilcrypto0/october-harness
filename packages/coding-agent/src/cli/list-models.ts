@@ -36,7 +36,15 @@ export async function listModels(
 		console.error(chalk.yellow(`Warning: errors loading models.json:\n${loadError}`));
 	}
 
-	const models = [...(await modelRuntime.getAvailable(undefined, { signal }))];
+	let models: Model<Api>[];
+	try {
+		models = [...(await modelRuntime.getAvailable(undefined, { signal }))];
+	} catch (error) {
+		if (!signal?.aborted) throw error;
+		// A slow auth check must not hang or fail a metadata command; list what is already known.
+		console.error(chalk.yellow("Warning: model availability check timed out; showing the last known models."));
+		models = [...modelRuntime.getAvailableSnapshot()];
+	}
 
 	if (models.length === 0) {
 		console.log(getNoModelsGuidance(modelRuntime, "shell").message);

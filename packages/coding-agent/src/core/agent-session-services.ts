@@ -25,6 +25,8 @@ import { SettingsManager } from "./settings-manager.ts";
 export interface AgentSessionRuntimeDiagnostic {
 	type: "info" | "warning" | "error";
 	message: string;
+	/** Stable machine-readable code for callers that classify diagnostics, e.g. "model_not_found". */
+	code?: string;
 }
 
 /**

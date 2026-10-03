@@ -63,7 +63,7 @@ import {
 	VERSION,
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
-import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import { formatNoModelsAvailableMessage, getNoModelsGuidance } from "../../core/auth-guidance.ts";
 import {
@@ -109,6 +109,7 @@ import {
 	sessionEntryToContextMessages,
 	type UsageEntry,
 } from "../../core/session-manager.ts";
+import { formatPortableSessionDiagnostics, SessionImportError } from "../../core/session-portable.ts";
 import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
@@ -6302,8 +6303,12 @@ export class InteractiveMode {
 
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
-				const filePath = this.session.exportToJsonl(outputPath);
-				this.showStatus(`Session exported to: ${filePath}`);
+				const { path, diagnostics } = this.session.exportToJsonl(outputPath);
+				this.showStatus(`Session exported to: ${path}`);
+				const lines = formatPortableSessionDiagnostics(diagnostics);
+				if (lines.length > 0) {
+					this.showWarning(`Portable export omitted or changed:\n${lines.join("\n")}`);
+				}
 			} else {
 				const filePath = await this.session.exportToHtml(outputPath, {
 					themeName: theme.name,
@@ -6380,7 +6385,7 @@ export class InteractiveMode {
 				this.showStatus(`Session imported from: ${inputPath}`);
 				return;
 			}
-			if (error instanceof SessionImportFileNotFoundError) {
+			if (error instanceof SessionImportError) {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
 			}

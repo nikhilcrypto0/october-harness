@@ -151,6 +151,25 @@ describe("parseArgs", () => {
 			expect(result.export).toBe("session.jsonl");
 		});
 
+		// Regression test for #2.
+		test("parses --import", () => {
+			const result = parseArgs(["--import", "portable.jsonl", "-p", "hi"]);
+			expect(result.import).toBe("portable.jsonl");
+			expect(result.messages).toEqual(["hi"]);
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		// Regression test for #2.
+		test("reports --import without a path", () => {
+			for (const args of [["--import"], ["--import", "--continue"]]) {
+				const result = parseArgs(args);
+				expect(result.import).toBeUndefined();
+				expect(result.diagnostics).toEqual([
+					{ type: "error", message: "--import requires a portable session file path" },
+				]);
+			}
+		});
+
 		test("parses --thinking", () => {
 			const result = parseArgs(["--thinking", "high"]);
 			expect(result.thinking).toBe("high");

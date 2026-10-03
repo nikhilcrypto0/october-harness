@@ -64,7 +64,7 @@ describe("JSONL share export", () => {
 			const originalEntryIds = sessionManager.getBranch().map((entry) => entry.id);
 
 			const normalPath = join(tempDir, "normal.jsonl");
-			session.exportToJsonl(normalPath);
+			expect(session.exportToJsonl(normalPath).path).toBe(normalPath);
 			const normalRecords = readFileSync(normalPath, "utf8")
 				.trim()
 				.split("\n")

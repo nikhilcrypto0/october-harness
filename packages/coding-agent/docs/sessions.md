@@ -55,7 +55,7 @@ Use `--session` when you already know the session path or ID. Use `--fork` to cr
 
 ## Export or share a session
 
-Use `/export` to write the current session as HTML or JSONL. Use `/share` to upload it and get a viewer link. Pi uses a Radius artifact when Radius authentication is configured; otherwise, it uses a private GitHub gist.
+Use `/export` to write the current session as HTML or JSONL. A `.jsonl` export is a [portable session](session-format.md#portable-sessions): the active branch, whose structured fields leave out harness credentials, provider replay secrets, and source-machine path fields, with every left-out value reported. Transcript content is not redacted, so message text, tool arguments, and command output can still contain paths or secrets. Import it on another machine or entry point with `/import`, `--import`, RPC `import_jsonl`, or the SDK. Use `/share` to upload the session and get a viewer link. Pi uses a Radius artifact when Radius authentication is configured; otherwise, it uses a private GitHub gist.
 
 Review exported or shared sessions first. They can contain prompts, model responses, tool arguments, command output, file contents, and extension messages.
 

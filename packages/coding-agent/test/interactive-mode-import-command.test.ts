@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { SessionImportFileNotFoundError } from "../src/core/agent-session-runtime.ts";
+import { PortableSessionError, SessionImportFileNotFoundError } from "../src/core/session-portable.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type PathCommand = "/export" | "/import";
@@ -137,6 +137,44 @@ describe("InteractiveMode /import parsing", () => {
 		await interactiveModePrototype.handleImportCommand.call(context, "/import /tmp/missing-session.jsonl");
 
 		expect(showError).toHaveBeenCalledWith("Failed to import session: File not found: /tmp/missing-session.jsonl");
+		expect(showStatus).not.toHaveBeenCalled();
+		expect(handleFatalRuntimeError).not.toHaveBeenCalled();
+	});
+
+	// Regression test for #2.
+	it("shows a non-fatal error when a portable session file is invalid", async () => {
+		const portableError = new PortableSessionError("invalid_entry", "unexpected field", {
+			source: "/tmp/portable.jsonl",
+			line: 3,
+			path: "$.message.content[0].thinkingSignature",
+		});
+		const importFromJsonl = vi.fn(async () => {
+			throw portableError;
+		});
+		const showStatus = vi.fn();
+		const showError = vi.fn();
+		const handleFatalRuntimeError = vi.fn(async () => {
+			throw new Error("unexpected fatal error");
+		});
+
+		const context: ImportCommandContext = {
+			clearStatusIndicator: vi.fn(),
+			runtimeHost: { importFromJsonl },
+			showError,
+			showStatus,
+			showExtensionConfirm: vi.fn(async () => true),
+			handleRuntimeSessionChange: vi.fn(async () => {}),
+			renderCurrentSessionState: vi.fn(),
+			handleFatalRuntimeError,
+			promptForMissingSessionCwd: vi.fn(async () => undefined),
+			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
+		};
+
+		await interactiveModePrototype.handleImportCommand.call(context, "/import /tmp/portable.jsonl");
+
+		expect(showError).toHaveBeenCalledWith(
+			"Failed to import session: Invalid portable session /tmp/portable.jsonl (line 3, $.message.content[0].thinkingSignature): unexpected field",
+		);
 		expect(showStatus).not.toHaveBeenCalled();
 		expect(handleFatalRuntimeError).not.toHaveBeenCalled();
 	});

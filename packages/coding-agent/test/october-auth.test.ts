@@ -14,6 +14,7 @@ import {
 	ensureDesktopOctoberAccess,
 	getDesktopOctoberCredential,
 	OCTOBER_PROVIDER_ID,
+	OctoberSessionUnavailableError,
 	octoberSessionAvailable,
 	resetDesktopOctoberState,
 	seedOctoberCredential,
@@ -117,6 +118,14 @@ describe("october auth session gate", () => {
 		process.env.OCTOBER_SUPABASE_ACCESS_TOKEN = "access-1";
 		expect(octoberSessionAvailable()).toBe(false);
 		process.env.OCTOBER_SUPABASE_REFRESH_TOKEN = "refresh-1";
+		expect(octoberSessionAvailable()).toBe(true);
+	});
+
+	it("accepts a Desktop session without a refresh token because the Bus owns refresh", () => {
+		setSupabaseEnv();
+		delete process.env.OCTOBER_SUPABASE_REFRESH_TOKEN;
+		expect(octoberSessionAvailable()).toBe(false);
+		process.env.OCTOBER_BUS_PORT = "9";
 		expect(octoberSessionAvailable()).toBe(true);
 	});
 });
@@ -364,13 +373,12 @@ describe("october credential seeding", () => {
 		expect(supabaseHits).toEqual([]);
 	});
 
-	it("falls back to Supabase when the bus token route is not live", async () => {
-		const expiresAt = Math.floor(Date.now() / 1000) + 3600;
-		const supabase = await listen((_request, response) => {
+	it("fails with a typed session error and never calls Supabase when the bus token route is not live", async () => {
+		const supabaseHits: string[] = [];
+		const supabase = await listen((request, response) => {
+			supabaseHits.push(request.url ?? "");
 			response.writeHead(200, { "Content-Type": "application/json" });
-			response.end(
-				JSON.stringify({ access_token: "access-sb", refresh_token: "refresh-sb", expires_at: expiresAt }),
-			);
+			response.end(JSON.stringify({ access_token: "access-sb", refresh_token: "refresh-sb" }));
 		});
 		const bus = await listen((_request, response) => {
 			response.writeHead(404).end();
@@ -379,12 +387,30 @@ describe("october credential seeding", () => {
 		process.env.OCTOBER_BUS_PORT = address.port;
 		process.env.OCTOBER_BUS_TOKEN = "bus-secret";
 		const oauth = buildOctoberOAuth();
-		const refreshed = await oauth.refreshToken(
+		const refresh = oauth.refreshToken(
 			{ access: "old", refresh: "refresh-1", expires: 0, supabaseUrl: supabase.url, supabaseAnonKey: "anon" },
 			AbortSignal.timeout(5000),
 		);
-		expect(refreshed.access).toBe("access-sb");
-		expect(refreshed.refresh).toBe("refresh-sb");
+		await expect(refresh).rejects.toBeInstanceOf(OctoberSessionUnavailableError);
+		await expect(refresh).rejects.toThrow(/october_session_unavailable.*HTTP 404/);
+		expect(supabaseHits).toEqual([]);
+	});
+
+	it("fails with a typed session error in Desktop mode when the bus token is missing", async () => {
+		const supabaseHits: string[] = [];
+		const supabase = await listen((request, response) => {
+			supabaseHits.push(request.url ?? "");
+			response.writeHead(500).end();
+		});
+		process.env.OCTOBER_BUS_PORT = "9";
+		const oauth = buildOctoberOAuth();
+		await expect(
+			oauth.refreshToken(
+				{ access: "old", refresh: "refresh-1", expires: 0, supabaseUrl: supabase.url, supabaseAnonKey: "anon" },
+				AbortSignal.timeout(5000),
+			),
+		).rejects.toThrow(/october_session_unavailable.*not configured/);
+		expect(supabaseHits).toEqual([]);
 	});
 
 	it("does not fall back to Supabase after the bus has succeeded once", async () => {
@@ -516,46 +542,50 @@ describe("october credential seeding", () => {
 		expect(getDesktopOctoberCredential()?.access).toBe("access-B");
 	});
 
-	it("does not fall back to Supabase if the bus env disappears after a success", async () => {
-		const supabaseHits: string[] = [];
-		const supabase = await listen((request, response) => {
-			supabaseHits.push(request.url ?? "");
-			response.writeHead(500).end("supabase fallback must not run after a successful bus refresh");
-		});
+	it("refreshes via the bus when Desktop injects no refresh token", async () => {
 		const bus = await listen((_request, response) => {
 			response.writeHead(200, { "Content-Type": "application/json" });
 			response.end(JSON.stringify({ access_token: "access-bus", expires_at: Math.floor(Date.now() / 1000) + 3600 }));
 		});
-		const address = new URL(bus.url);
-		process.env.OCTOBER_BUS_PORT = address.port;
+		process.env.OCTOBER_BUS_PORT = new URL(bus.url).port;
 		process.env.OCTOBER_BUS_TOKEN = "bus-secret";
-		const oauth = buildOctoberOAuth();
-		const first = await oauth.refreshToken(
-			{
-				access: "old",
-				refresh: "refresh-dead",
-				expires: 0,
-				supabaseUrl: supabase.url,
-				supabaseAnonKey: "anon",
-			},
-			AbortSignal.timeout(5000),
-		);
-		expect(first.access).toBe("access-bus");
+		setSupabaseEnv({ OCTOBER_SUPABASE_EXPIRES_AT: String(Math.floor(Date.now() / 1000) + 60) });
+		delete process.env.OCTOBER_SUPABASE_REFRESH_TOKEN;
+		await seedOctoberCredential();
+		expect(getDesktopOctoberCredential()?.access).toBe("access-1");
+		await ensureDesktopOctoberAccess();
+		expect(getDesktopOctoberCredential()?.access).toBe("access-bus");
+		expect(process.env.OCTOBER_INFERENCE_TOKEN).toBe("access-bus");
+	});
 
-		delete process.env.OCTOBER_BUS_PORT;
-		delete process.env.OCTOBER_BUS_TOKEN;
-		await expect(
-			oauth.refreshToken(
-				{
-					...first,
-					refresh: "refresh-dead",
-					supabaseUrl: supabase.url,
-					supabaseAnonKey: "anon",
-				},
-				AbortSignal.timeout(5000),
-			),
-		).rejects.toThrow(/bus token refresh is not available/);
-		expect(supabaseHits).toEqual([]);
+	it("keeps an unexpired Desktop token when a bus refresh inside the expiry margin fails", async () => {
+		let busRequests = 0;
+		const bus = await listen((_request, response) => {
+			busRequests++;
+			response.writeHead(503).end();
+		});
+		process.env.OCTOBER_BUS_PORT = new URL(bus.url).port;
+		process.env.OCTOBER_BUS_TOKEN = "bus-secret";
+		setSupabaseEnv({
+			OCTOBER_SUPABASE_ACCESS_TOKEN: "access-still-valid",
+			OCTOBER_SUPABASE_EXPIRES_AT: String(Math.floor(Date.now() / 1000) + 180),
+		});
+		await seedOctoberCredential();
+		expect(desktopOctoberTokenNeedsRefresh()).toBe(true);
+		await ensureDesktopOctoberAccess();
+		expect(busRequests).toBe(1);
+		expect(getDesktopOctoberCredential()?.access).toBe("access-still-valid");
+	});
+
+	it("fails with a typed session error once the Desktop token has expired and the bus refuses", async () => {
+		const bus = await listen((_request, response) => {
+			response.writeHead(503).end();
+		});
+		process.env.OCTOBER_BUS_PORT = new URL(bus.url).port;
+		process.env.OCTOBER_BUS_TOKEN = "bus-secret";
+		setSupabaseEnv({ OCTOBER_SUPABASE_EXPIRES_AT: String(Math.floor(Date.now() / 1000) - 10) });
+		await seedOctoberCredential();
+		await expect(ensureDesktopOctoberAccess()).rejects.toBeInstanceOf(OctoberSessionUnavailableError);
 	});
 
 	it("re-reads $OCTOBER_INFERENCE_TOKEN from the environment on each resolve", async () => {
@@ -640,4 +670,42 @@ describe("october credential seeding", () => {
 		expect((await runtime.getAuth(OCTOBER_PROVIDER_ID))?.auth.apiKey).toBe("access-via-runtime");
 		expect(await credentials.read(OCTOBER_PROVIDER_ID)).toBeUndefined();
 	});
+});
+
+describe("october Supabase host", () => {
+	it.each(["https://auth.october.dev", "https://latwxiqjgvluiddckvmj.supabase.co"])(
+		"refreshes a standalone session against %s verbatim",
+		async (host) => {
+			const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+				return new Response(
+					JSON.stringify({
+						access_token: "access-2",
+						refresh_token: "refresh-2",
+						expires_at: Math.floor(Date.now() / 1000) + 3600,
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			});
+			try {
+				setSupabaseEnv({ OCTOBER_SUPABASE_URL: `${host}/` });
+				const oauth = buildOctoberOAuth();
+				const login = await oauth.login({
+					onAuth: () => {},
+					onDeviceCode: () => {},
+					onPrompt: async () => "",
+					onSelect: async () => undefined,
+				});
+				expect(login.supabaseUrl).toBe(host);
+				const refreshed = await oauth.refreshToken(login, AbortSignal.timeout(5000));
+				expect(fetchSpy).toHaveBeenCalledTimes(1);
+				const [url, init] = fetchSpy.mock.calls[0]!;
+				expect(String(url)).toBe(`${host}/auth/v1/token?grant_type=refresh_token`);
+				expect((init?.headers as Record<string, string>).apikey).toBe("anon-key");
+				expect(refreshed.access).toBe("access-2");
+				expect(refreshed.supabaseUrl).toBe(host);
+			} finally {
+				fetchSpy.mockRestore();
+			}
+		},
+	);
 });

@@ -28,14 +28,14 @@ Extensions, prompt templates, and skills can add commands. The command menu in P
 | `/fork` | Create a new session from an earlier user message |
 | `/clone` | Duplicate the current session at its current position |
 | `/compact [instructions]` | Compact the current context, optionally with custom instructions |
-| `/import <path>` | Import and resume a JSONL session |
+| `/import <path>` | Import and resume a JSONL session. [Portable sessions](session-format.md#portable-sessions) are validated and take the current directory; other session files are copied as-is |
 
 ## Export and share
 
 | Command | Description |
 |---|---|
 | `/copy` | Copy the last assistant message |
-| `/export [path]` | Export the session as HTML or JSONL |
+| `/export [path]` | Export the session as HTML, or as a [portable session](session-format.md#portable-sessions) when the path ends in `.jsonl` |
 | `/share` | Upload the session and return a viewer link |
 | `/bug [description]` | Prepare a private bug report for the Pi developers |
 

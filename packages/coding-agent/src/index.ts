@@ -292,6 +292,26 @@ export {
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.ts";
 export {
+	commitPortableImport,
+	exportPortableSession,
+	formatPortableSessionDiagnostics,
+	importPortableSession,
+	PORTABLE_SESSION_MARKER,
+	type PortableImportOptions,
+	type PortableSessionDiagnostic,
+	PortableSessionError,
+	type PortableSessionErrorCode,
+	type PortableSessionExportResult,
+	type PortableSessionSerialization,
+	type PortableSessionSource,
+	type PreparedPortableImport,
+	preparePortableImport,
+	SessionImportError,
+	SessionImportFileNotFoundError,
+	SessionImportIdConflictError,
+	serializePortableSession,
+} from "./core/session-portable.ts";
+export {
 	type CacheWarmingMode,
 	type CompactionModelOverride,
 	type CompactionSettings,

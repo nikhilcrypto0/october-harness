@@ -38,6 +38,7 @@ export interface Args {
 	noExtensions?: boolean;
 	print?: boolean;
 	export?: string;
+	import?: string;
 	noSkills?: boolean;
 	skills?: string[];
 	promptTemplates?: string[];
@@ -179,6 +180,14 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--export" && i + 1 < args.length) {
 			result.export = args[++i];
+		} else if (arg === "--import") {
+			const inputPath = args[i + 1];
+			if (inputPath === undefined || inputPath.startsWith("-")) {
+				result.diagnostics.push({ type: "error", message: "--import requires a portable session file path" });
+			} else {
+				result.import = inputPath;
+				i++;
+			}
 		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
 			result.extensions = result.extensions ?? [];
 			result.extensions.push(args[++i]);
@@ -327,7 +336,8 @@ ${chalk.bold("Options:")}
   --use-theme <name[/name]>      Set the initial interactive theme for this run
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
-  --export <file>                Export session file to HTML and exit
+  --export <file> [out]          Export session file to HTML, or to a portable session when out ends in .jsonl, and exit
+  --import <file>                Import a portable session file as a new session in this project
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
   --tui-mode <mode>              TUI mode: regular (default) or fullscreen
@@ -410,6 +420,10 @@ ${chalk.bold("Examples:")}
   # Export a session file to HTML
   ${APP_NAME} --export ~/${CONFIG_DIR_NAME}/agent/sessions/--path--/session.jsonl
   ${APP_NAME} --export session.jsonl output.html
+
+  # Move a session to another machine or harness mode as a portable session
+  ${APP_NAME} --export session.jsonl portable.jsonl
+  ${APP_NAME} --import portable.jsonl
 
 ${chalk.bold("Environment Variables:")}
   ANTHROPIC_AUTH_TOKEN             - Anthropic bearer auth token

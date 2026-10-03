@@ -89,8 +89,20 @@ export function describeOctoberBearer(token: string | undefined): "no token" | "
 	return "other";
 }
 
+/** Whether the last network refresh in this process returned the gateway's live catalogue. */
+let octoberCatalogLive = false;
+
+/**
+ * True when the current October catalogue came from the gateway rather than the seed list. The
+ * gateway catalogue is per deployment and never partial, so an id missing from it is not served.
+ */
+export function octoberCatalogIsLive(): boolean {
+	return octoberCatalogLive;
+}
+
 function seedFallback(reason: string): ProviderModelConfig[] {
 	logOctoberDebug(`models fallback: ${reason}`);
+	octoberCatalogLive = false;
 	return OCTOBER_SEED_MODELS;
 }
 
@@ -225,6 +237,7 @@ export async function refreshOctoberModels(context: RefreshModelsContext): Promi
 		// list — otherwise `--provider october` has no models until the next successful refresh.
 		if (!ordered.length) return seedFallback("empty catalogue");
 		setOctoberPricing(pricing);
+		octoberCatalogLive = true;
 		return ordered;
 	} catch (error) {
 		return seedFallback(`throw: ${error instanceof Error ? error.message : String(error)}`);
