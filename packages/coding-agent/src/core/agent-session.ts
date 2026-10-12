@@ -49,6 +49,7 @@ import {
 	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
+import { OCTOBER_SESSION_REFRESHED_CODE } from "../extensions/october/auth.ts";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { processImage } from "../utils/image-process.ts";
@@ -3326,6 +3327,8 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
+		// October replaced a token the gateway rejected; the next attempt uses the new one.
+		if (message.errorMessage?.includes(OCTOBER_SESSION_REFRESHED_CODE)) return true;
 		return isRetryableAssistantError(message);
 	}
 

@@ -105,7 +105,6 @@ describe("October package branding", () => {
 			"!dist/cli/experimental",
 			"docs",
 			"CHANGELOG.md",
-			"npm-shrinkwrap.json",
 		]);
 		expect(pkg.files).not.toContain("examples");
 		const tsconfig = JSON.parse(readFileSync(join(dirname(packageJsonPath), "tsconfig.build.json"), "utf-8")) as {

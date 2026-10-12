@@ -32,9 +32,12 @@ export function inspectOctoberTarball(tarball) {
 	const manifest = JSON.parse(run("tar", ["-xOf", tarball, "package/package.json"]));
 	const version = validateOctoberManifest(manifest);
 	const files = new Set(run("tar", ["-tzf", tarball]).trim().split("\n"));
-	for (const file of ["dist/cli.js", "dist/index.js", "dist/bundle/cli.js", "npm-shrinkwrap.json", "README.md"]) {
+	for (const file of ["dist/cli.js", "dist/index.js", "dist/bundle/cli.js", "README.md"]) {
 		if (!files.has(`package/${file}`)) throw new Error(`Release tarball is missing ${file}`);
 	}
+	// A published shrinkwrap makes npm install exactly its entries and ignore os/cpu: every esbuild
+	// platform build when pinned, none when omitted. Without one, npm installs only the host's build.
+	if (files.has("package/npm-shrinkwrap.json")) throw new Error("Release tarball must not contain npm-shrinkwrap.json");
 	return { version, integrity: `sha512-${createHash("sha512").update(readFileSync(tarball)).digest("base64")}` };
 }
 
