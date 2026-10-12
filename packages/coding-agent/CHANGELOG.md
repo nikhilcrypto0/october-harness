@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.87.1-october.5] - 2026-10-10
+
+### Fixed
+
+- Fixed registry installs of 0.87.1-october.4 missing esbuild entirely. npm installs exactly the entries of a published `npm-shrinkwrap.json` and ignores their platform fields, so the shrinkwrap either installed all 26 esbuild builds (about 285 MB) or, in 0.87.1-october.4, none. The package now ships without a shrinkwrap: npm installs only the current platform's esbuild build (about 164 MB in total on macOS arm64). Direct dependencies stay pinned to exact versions; transitive dependencies resolve within their declared ranges at install time. The `october` CLI did not load esbuild and was unaffected; the experimental plugin bundler was.
+
+## [0.87.1-october.4] - 2026-10-10
+
+### Added
+
+- Added sign-in from a launching app's environment without a refresh token. With `OCTOBER_SUPABASE_URL`, `OCTOBER_SUPABASE_ANON_KEY`, `OCTOBER_SUPABASE_ACCESS_TOKEN`, and optionally `OCTOBER_SUPABASE_EXPIRES_AT`, October uses the token for the model catalog, inference, and plan checks without `/login`, and never writes it to disk. `OCTOBER_TOKEN_COMMAND` names a command that prints `{"accessToken","expiresAt"}`; it runs shortly before expiry and after a 401, and the turn that hit the 401 is retried. When the token expires and cannot be refreshed, October falls back to `/login`. See [Environment variables](docs/environment-variables.md#october-session-from-a-launching-app).
+
+### Fixed
+
+- Fixed `npm install @october-dev/october` installing esbuild binaries for all 26 platforms (about 285 MB). npm ignores platform fields for packages pinned in a dependency's shrinkwrap, so the shrinkwrap no longer pins optional platform packages; npm resolves them from esbuild's exact `optionalDependencies` and installs only the current platform's build.
+
 ## [0.87.1-october.3] - 2026-09-30
 
 ### Added
@@ -19,6 +35,8 @@
 ### Fixed
 
 - Fixed one-shot `--provider october` runs warning that a gateway-served model was not found. Model ids are now matched exactly, never to a similar id. When the requested id is missing, the October catalogue is fetched once (5 second limit); if the live catalogue does not offer the id, the run fails with a `model_not_found` error naming it, and if the catalogue cannot be fetched, the id is sent as given with a `model_unverified` warning.
+- Fixed Together DeepSeek V4 Pro losing its thinking level controls after Together renamed it to `deepseek-ai/DeepSeek-V4-Pro-0813` ([#10336](https://github.com/earendil-works/pi/pull/10336) by [@cv](https://github.com/cv))
+- Fixed the default NVIDIA model pointing at `nvidia/nemotron-3-super-120b-a12b`, which NVIDIA no longer serves; the default is now `nvidia/nemotron-3-ultra-550b-a55b`
 
 ## [0.87.1-october.2] - 2026-09-25
 

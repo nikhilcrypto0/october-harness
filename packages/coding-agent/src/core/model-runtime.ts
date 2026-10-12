@@ -43,7 +43,9 @@ import {
 	ensureDesktopOctoberAccess,
 	getDesktopOctoberCredential,
 	isOctoberDesktopMode,
+	isOctoberManagedSessionMode,
 	OCTOBER_PROVIDER_ID,
+	resolveManagedOctoberAccessToken,
 } from "../extensions/october/auth.ts";
 import { OCTOBER_NVIDIA_COMPAT } from "../extensions/october/provider.ts";
 import { loginOctoberWithStore, logoutOctoberWithStore } from "../extensions/october/token-lifecycle.ts";
@@ -180,15 +182,16 @@ export class ModelRuntime implements Models {
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
 		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
-		if (isOctoberDesktopMode()) {
+		if (isOctoberManagedSessionMode()) {
 			// Install before catalog refresh or availability checks. Keep ownership
 			// for this runtime even if Desktop later clears the injected session.
-			credentials.setRuntimeApiKey(OCTOBER_PROVIDER_ID, async (signal) => {
-				if (!isOctoberDesktopMode()) return undefined;
-				await ensureDesktopOctoberAccess(signal);
-				const credential = getDesktopOctoberCredential();
-				return credential && credential.expires > Date.now() ? credential.access : undefined;
-			});
+			// Another launching app's session falls back to the stored /login credential once unusable.
+			const desktop = isOctoberDesktopMode();
+			credentials.setRuntimeApiKey(
+				OCTOBER_PROVIDER_ID,
+				async (signal) => (isOctoberManagedSessionMode() ? resolveManagedOctoberAccessToken(signal) : undefined),
+				{ fallbackToStore: !desktop },
+			);
 		}
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));

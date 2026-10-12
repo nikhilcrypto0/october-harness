@@ -98,3 +98,29 @@ These variables are read by Pi itself:
 | `HTTP_PROXY`, `HTTPS_PROXY` | Proxy outbound HTTP requests |
 
 Provider credentials such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and cloud-provider configuration are listed in [Provider Authentication](providers.md#use-an-api-key-from-the-environment).
+
+## October Session From a Launching App
+
+An app that is already signed in to October (October Desktop, October Lantern) can start October signed in by passing the user's session in the environment. No `/login` is needed.
+
+| Variable | Description |
+|----------|-------------|
+| `OCTOBER_SUPABASE_URL` | Supabase project URL. Required |
+| `OCTOBER_SUPABASE_ANON_KEY` | Supabase anon (public) key. Required |
+| `OCTOBER_SUPABASE_ACCESS_TOKEN` | The signed-in user's access token (JWT). Sent as the bearer for the model catalog, inference, and plan checks. Required |
+| `OCTOBER_SUPABASE_EXPIRES_AT` | Access token expiry in unix seconds. Optional; the JWT `exp` claim is used when absent |
+| `OCTOBER_TOKEN_COMMAND` | Optional shell command that prints a fresh token (see below) |
+
+Without `OCTOBER_SUPABASE_REFRESH_TOKEN`, the launching app owns the session. October keeps it in memory only: it is never written to `~/.october/agent/` and never logged. A stored `/login` account is not used while the session is valid.
+
+`OCTOBER_TOKEN_COMMAND` is run through the shell with the process environment. It must exit with code 0 and print one JSON object on stdout:
+
+```json
+{"accessToken": "<jwt>", "expiresAt": 1791234567}
+```
+
+`expiresAt` is unix seconds; when absent, the JWT `exp` claim is used. October runs the command within 5 minutes of expiry (and every 30 seconds after a failed attempt while the old token is still valid), and after the October gateway answers HTTP 401. After a 401 with a new token, the failed turn is retried. A run is limited to 15 seconds and 64 KB of output. Its output is never logged.
+
+If the token has expired and there is no command, or the command fails once the token can no longer be used, October drops the session and falls back to the normal sign-in: a stored `/login` account is used if present, otherwise October asks the user to run `/login`.
+
+October Desktop (`OCTOBER_BUS_PORT` set) refreshes over its Bus instead and ignores `OCTOBER_TOKEN_COMMAND`. A session that includes `OCTOBER_SUPABASE_REFRESH_TOKEN` is imported into the credential store and refreshed against Supabase, as before.
